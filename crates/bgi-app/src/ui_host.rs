@@ -143,41 +143,24 @@ impl UiHost {
             raw_display_handle: Some(RawDisplayHandle::Windows(WindowsDisplayHandle::new())),
             raw_window_handle: RawWindowHandle::Win32(raw_window),
         };
-        let mut instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12,
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let mut surface = unsafe { instance.create_surface_unsafe(make_target()) }
+        let surface = unsafe { instance.create_surface_unsafe(make_target()) }
             .map_err(|e| format!("创建 wgpu Surface 失败: {e}"))?;
 
         let init_rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .map_err(|e| e.to_string())?;
-        let adapter = match init_rt.block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            ..Default::default()
-        })) {
-            Ok(a) => a,
-            Err(_) => {
-                drop(surface);
-                instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                    backends: wgpu::Backends::PRIMARY,
-                    ..wgpu::InstanceDescriptor::new_without_display_handle()
-                });
-                surface = unsafe { instance.create_surface_unsafe(make_target()) }
-                    .map_err(|e| format!("回退创建 wgpu Surface 失败: {e}"))?;
-                init_rt
-                    .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                        power_preference: wgpu::PowerPreference::LowPower,
-                        compatible_surface: Some(&surface),
-                        force_fallback_adapter: false,
-                        ..Default::default()
-                    }))
-                    .map_err(|e| format!("找不到兼容 GPU/WARP 适配器: {e}"))?
-            }
-        };
+        let adapter = init_rt
+            .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+                ..Default::default()
+            }))
+            .map_err(|e| format!("找不到兼容 GPU/WARP 适配器: {e}"))?;
         let adapter_info = adapter.get_info();
         tracing::info!(
             "egui-wgpu 渲染后端: {:?}, 适配器: {}",
@@ -419,6 +402,7 @@ impl UiHost {
 
     pub fn teardown(self, client: &ControlClient) {
         client.waker_slot().set(None);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         let hwnd = self.hwnd;
         let _input_state = self.input_state;
         drop(self.renderer);

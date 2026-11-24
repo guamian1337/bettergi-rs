@@ -332,10 +332,29 @@ impl BgiAppUi {
         ui.horizontal(|ui| {
             ui.label("筛选:");
             ui.text_edit_singleline(&mut self.path_filter);
-            if ui.button("启动基础寻路").clicked() {
+            let is_pathing = matches!(snapshot.task_state, TaskState::Pathing { .. });
+            if ui.add_enabled(!is_pathing, egui::Button::new("启动基础寻路 (F8)")).clicked() {
                 self.send_cmd(client, "启动基础寻路", CoreCommand::StartBasicPathing);
             }
+            if ui.add_enabled(is_pathing, egui::Button::new("停止寻路")).clicked() {
+                self.send_cmd(client, "停止寻路", CoreCommand::StopPathing);
+            }
         });
+
+        if let TaskState::Pathing {
+            task_name,
+            current_index,
+            total_points,
+        } = &snapshot.task_state
+        {
+            let total = (*total_points).max(1);
+            let frac = (*current_index as f32 / total as f32).clamp(0.0, 1.0);
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .text(format!("正在执行「{task_name}」: 点位 {current_index}/{total_points}"))
+                    .animate(true),
+            );
+        }
 
         ui.separator();
         ui.label(format!("已发现 {} 条路径:", snapshot.paths.len()));
@@ -429,7 +448,11 @@ impl BgiAppUi {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("截图模式:");
-            for mode in [CaptureMode::BitBlt, CaptureMode::Wgc] {
+            for mode in [
+                CaptureMode::BitBlt,
+                CaptureMode::Wgc,
+                CaptureMode::DwmSharedSurface,
+            ] {
                 let checked = snapshot.config.capture_mode == mode;
                 if ui.selectable_label(checked, mode.label()).clicked() {
                     self.send_cmd(client, "切换截图模式", CoreCommand::SetCaptureMode(mode));
@@ -518,7 +541,9 @@ impl BgiAppUi {
             let avail = ui.available_size();
             let tex_size = tex.size_vec2();
             if tex_size.x > 0.0 && tex_size.y > 0.0 {
-                let scale = (avail.x / tex_size.x).min((avail.y - 16.0).max(120.0) / tex_size.y).min(1.0);
+                let scale = (avail.x / tex_size.x)
+                    .min((avail.y - 16.0).max(120.0) / tex_size.y)
+                    .min(1.0);
                 ui.image((tex.id(), tex_size * scale));
             }
         }

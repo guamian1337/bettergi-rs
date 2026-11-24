@@ -1,22 +1,26 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bgi_capture::{
-    CapturerBackend, FrameBufferPool, PooledBuffer, bgra_to_preview, enumerate_candidate_windows,
+    CapturedFrame, CapturerBackend, FrameBufferPool, enumerate_candidate_windows, frame_to_preview,
 };
 use bgi_control::{
     CaptureMode, CoreCommand, CoreEndpoint, CoreEvent, CvDebugResult, HotkeyAction, LogLevel,
     TaskState, UiSnapshot,
 };
-use bgi_cv::matchers::{bgra_to_bgr_mat, extract_minimap_bgr};
+use bgi_cv::matchers::{extract_minimap_bgr, frame_to_bgr_mat};
 use bgi_cv::orientation::{MiniMapPreprocessor, compute_character_orientation};
 use bgi_cv::sift_map::BigMapSiftMatcher;
 use bgi_cv::teyvat_minimap::{LayerLoadScope, TeyvatMiniMapLocalizer};
-use bgi_infer::paddle_ocr::{PaddleOcrEngine, PaddleOcrPaths};
 use bgi_infer::{IdleUnloadPolicy, OcrService};
+use bgi_infer::paddle_ocr::{PaddleOcrEngine, PaddleOcrPaths};
 use bgi_input::{RawInputHub, RawInputSignal};
+use bgi_pathing::{MinimapObservation, OcrHit, PathExecutor};
 use tokio::sync::mpsc;
+
+use crate::pathing_host::{CorePathingHost, PathingEvent, to_projection};
 
 pub struct CoreHandle {
     join: Option<std::thread::JoinHandle<()>>,
@@ -30,7 +34,7 @@ impl CoreHandle {
     }
 }
 
-struct CvOcrServices {
+pub(crate) struct CvOcrServices {
     assets_dir: PathBuf,
     sift: Option<BigMapSiftMatcher>,
     minimap: Option<TeyvatMiniMapLocalizer>,
@@ -49,6 +53,127 @@ impl CvOcrServices {
             ocr: None,
             last_minimap_pos: None,
         }
+    }
+
+    pub(crate) fn set_last_minimap_pos(&mut self, pos: Option<(f32, f32)>) {
+        self.last_minimap_pos = pos;
+    }
+
+    fn ensure_minimap(&mut self) -> Result<&mut TeyvatMiniMapLocalizer, String> {
+        if self.minimap.is_none() {
+            let teyvat_dir = self.assets_dir.join("Map").join("Teyvat");
+            let localizer = TeyvatMiniMapLocalizer::new(
+                teyvat_dir,
+                LayerLoadScope::SurfaceOnly,
+                Duration::from_secs(60),
+            )
+            .map_err(|e| e.to_string())?;
+            self.minimap = Some(localizer);
+        }
+        Ok(self.minimap.as_mut().unwrap())
+    }
+
+    fn ensure_sift(&mut self) -> Result<&mut BigMapSiftMatcher, String> {
+        if self.sift.is_none() {
+            let teyvat_dir = self.assets_dir.join("Map").join("Teyvat");
+            let sift = BigMapSiftMatcher::load_teyvat_256(teyvat_dir).map_err(|e| e.to_string())?;
+            self.sift = Some(sift);
+        }
+        Ok(self.sift.as_mut().unwrap())
+    }
+
+    fn ensure_ocr(&mut self) -> Result<&mut PaddleOcrEngine, String> {
+        if self.ocr.is_none() {
+            let paddle_dir = self.assets_dir.join("Model").join("PaddleOCR");
+            let paths = PaddleOcrPaths::from_model_root(&paddle_dir, None).ok_or_else(|| {
+                format!("在 {paddle_dir:?} 下未找到 PP-OCRv5/V4 Det/Rec 模型与 inference.yml")
+            })?;
+            self.ocr = Some(PaddleOcrEngine::new(
+                paths,
+                IdleUnloadPolicy {
+                    idle_timeout: Duration::from_secs(60),
+                },
+            ));
+        }
+        Ok(self.ocr.as_mut().unwrap())
+    }
+
+    pub(crate) fn locate_minimap_step(
+        &mut self,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        is_bgr24: bool,
+        prev_override: Option<(f32, f32)>,
+    ) -> Result<Option<MinimapObservation>, String> {
+        let full_bgr = frame_to_bgr_mat(bytes, width, height, is_bgr24).map_err(|e| e.to_string())?;
+        let minimap_bgr = extract_minimap_bgr(&full_bgr).map_err(|e| e.to_string())?;
+        let hint = prev_override.or(self.last_minimap_pos);
+        let located = self
+            .ensure_minimap()?
+            .locate(&minimap_bgr, hint, 2)
+            .map_err(|e| e.to_string())?;
+        if let Some(m) = located {
+            self.last_minimap_pos = Some((m.game_x, m.game_y));
+            Ok(Some(MinimapObservation {
+                game_x: m.game_x,
+                game_y: m.game_y,
+                confidence: m.confidence,
+                camera_angle: m.camera_angle,
+                camera_confidence: m.camera_confidence,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn locate_bigmap_step(
+        &mut self,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        is_bgr24: bool,
+    ) -> Result<Option<(bgi_pathing::BigMapProjection, usize)>, String> {
+        let full_bgr = frame_to_bgr_mat(bytes, width, height, is_bgr24).map_err(|e| e.to_string())?;
+        match self.ensure_sift()?.locate_big_map_rect(&full_bgr) {
+            Ok(m) => Ok(Some(to_projection(m))),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn ocr_roi_step(
+        &mut self,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        is_bgr24: bool,
+        norm_x0: f32,
+        norm_y0: f32,
+        norm_x1: f32,
+        norm_y1: f32,
+    ) -> Result<Vec<OcrHit>, String> {
+        let (ox, oy, res) = self
+            .ensure_ocr()?
+            .recognize_frame_roi(
+                bytes,
+                width,
+                height,
+                is_bgr24,
+                norm_x0,
+                norm_y0,
+                norm_x1,
+                norm_y1,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(res
+            .regions
+            .into_iter()
+            .map(|r| OcrHit {
+                text: r.text,
+                center_x: ox + (r.x + r.width * 0.5).round() as i32,
+                center_y: oy + (r.y + r.height * 0.5).round() as i32,
+            })
+            .collect())
     }
 
     fn set_assets_dir(&mut self, dir: PathBuf) {
@@ -76,9 +201,16 @@ impl CvOcrServices {
         unloaded
     }
 
-    fn probe_minimap(&mut self, bgra: &[u8], width: u32, height: u32, seq: u64) -> Result<CvDebugResult, String> {
+    fn probe_minimap(
+        &mut self,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        is_bgr24: bool,
+        seq: u64,
+    ) -> Result<CvDebugResult, String> {
         let started = Instant::now();
-        let full_bgr = bgra_to_bgr_mat(bgra, width, height).map_err(|e| e.to_string())?;
+        let full_bgr = frame_to_bgr_mat(bytes, width, height, is_bgr24).map_err(|e| e.to_string())?;
         let minimap_bgr = extract_minimap_bgr(&full_bgr).map_err(|e| e.to_string())?;
 
         if self.orient.is_none() {
@@ -92,22 +224,10 @@ impl CvOcrServices {
             .map_err(|e| e.to_string())?;
         let char_angle = compute_character_orientation(&minimap_bgr).map_err(|e| e.to_string())?;
 
-        if self.minimap.is_none() {
-            let teyvat_dir = self.assets_dir.join("Map").join("Teyvat");
-            let localizer = TeyvatMiniMapLocalizer::new(
-                teyvat_dir,
-                LayerLoadScope::SurfaceOnly,
-                Duration::from_secs(60),
-            )
-            .map_err(|e| e.to_string())?;
-            self.minimap = Some(localizer);
-        }
-
+        let hint = self.last_minimap_pos;
         let located = self
-            .minimap
-            .as_mut()
-            .unwrap()
-            .locate(&minimap_bgr, self.last_minimap_pos, 2)
+            .ensure_minimap()?
+            .locate(&minimap_bgr, hint, 2)
             .map_err(|e| e.to_string())?;
 
         if let Some(m) = located {
@@ -143,18 +263,18 @@ impl CvOcrServices {
         }
     }
 
-    fn probe_bigmap_sift(&mut self, bgra: &[u8], width: u32, height: u32, seq: u64) -> Result<CvDebugResult, String> {
+    fn probe_bigmap_sift(
+        &mut self,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        is_bgr24: bool,
+        seq: u64,
+    ) -> Result<CvDebugResult, String> {
         let started = Instant::now();
-        let full_bgr = bgra_to_bgr_mat(bgra, width, height).map_err(|e| e.to_string())?;
-        if self.sift.is_none() {
-            let teyvat_dir = self.assets_dir.join("Map").join("Teyvat");
-            let sift = BigMapSiftMatcher::load_teyvat_256(teyvat_dir).map_err(|e| e.to_string())?;
-            self.sift = Some(sift);
-        }
+        let full_bgr = frame_to_bgr_mat(bytes, width, height, is_bgr24).map_err(|e| e.to_string())?;
         let (gx, gy, inliers) = self
-            .sift
-            .as_mut()
-            .unwrap()
+            .ensure_sift()?
             .locate_big_map(&full_bgr)
             .map_err(|e| e.to_string())?;
 
@@ -173,26 +293,19 @@ impl CvOcrServices {
         })
     }
 
-    fn probe_ocr(&mut self, bgra: &[u8], width: u32, height: u32, seq: u64) -> Result<CvDebugResult, String> {
+    fn probe_ocr(
+        &mut self,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        is_bgr24: bool,
+        seq: u64,
+    ) -> Result<CvDebugResult, String> {
         let started = Instant::now();
-        if self.ocr.is_none() {
-            let paddle_dir = self.assets_dir.join("Model").join("PaddleOCR");
-            let paths = PaddleOcrPaths::from_model_root(&paddle_dir, None).ok_or_else(|| {
-                format!("在 {paddle_dir:?} 下未找到 PP-OCRv5/V4 Det/Rec 模型与 inference.yml")
-            })?;
-            self.ocr = Some(PaddleOcrEngine::new(
-                paths,
-                IdleUnloadPolicy {
-                    idle_timeout: Duration::from_secs(60),
-                },
-            ));
-        }
-
+        let bgr = frame_to_bgr_mat(bytes, width, height, is_bgr24).map_err(|e| e.to_string())?;
         let res = self
-            .ocr
-            .as_mut()
-            .unwrap()
-            .recognize_bgra(bgra, width, height)
+            .ensure_ocr()?
+            .recognize_bgr_mat(&bgr)
             .map_err(|e| e.to_string())?;
 
         Ok(CvDebugResult {
@@ -307,8 +420,11 @@ async fn run_core_loop(mut core: CoreEndpoint) {
         ),
     );
 
-    let pool = FrameBufferPool::new(4);
-    let mut capturer: Option<(isize, CaptureMode, CapturerBackend)> = None;
+    let pool = Arc::new(FrameBufferPool::new(4));
+    let capturer: Arc<Mutex<Option<(isize, CaptureMode, CapturerBackend)>>> =
+        Arc::new(Mutex::new(None));
+    let (pathing_tx, mut pathing_rx) = mpsc::unbounded_channel::<PathingEvent>();
+    let mut active_pathing: Option<Arc<AtomicBool>> = None;
     let mut frame_seq = 0u64;
     let mut dbg_seq = 0u64;
     let mut pace = CapturePaceState::new();
@@ -330,12 +446,14 @@ async fn run_core_loop(mut core: CoreEndpoint) {
                     env.cmd,
                     &mut snapshot,
                     &raw_hub,
-                    &mut capturer,
+                    &capturer,
                     &pool,
                     &mut frame_seq,
                     &mut dbg_seq,
                     &mut pace,
                     &cv_ocr,
+                    &mut active_pathing,
+                    &pathing_tx,
                     &core,
                 ).await;
                 if !was_preview && snapshot.preview_enabled {
@@ -350,12 +468,55 @@ async fn run_core_loop(mut core: CoreEndpoint) {
             }
             Some(sig) = raw_rx.recv() => {
                 let was_preview = snapshot.preview_enabled;
-                handle_raw_signal(sig, &mut snapshot, &raw_hub, &mut capturer, &core);
+                handle_raw_signal(
+                    sig,
+                    &mut snapshot,
+                    &raw_hub,
+                    &capturer,
+                    &pool,
+                    &cv_ocr,
+                    &mut active_pathing,
+                    &pathing_tx,
+                    &core,
+                );
                 if !was_preview && snapshot.preview_enabled {
                     pace.reset();
                     next_capture_at = tokio::time::Instant::now();
                 }
                 core.publish_snapshot(Arc::new(snapshot.clone()));
+            }
+            Some(pev) = pathing_rx.recv() => {
+                match pev {
+                    PathingEvent::Progress { current_index, total_points } => {
+                        if let TaskState::Pathing { task_name, .. } = &snapshot.task_state {
+                            snapshot.task_state = TaskState::Pathing {
+                                task_name: task_name.clone(),
+                                current_index,
+                                total_points,
+                            };
+                            core.publish_snapshot(Arc::new(snapshot.clone()));
+                        }
+                    }
+                    PathingEvent::Log { level, message } => {
+                        core.emit_log(level, "Pathing", message);
+                    }
+                    PathingEvent::Finished(res) => {
+                        active_pathing = None;
+                        if let Err(err) = res {
+                            core.emit_log(LogLevel::Warn, "Pathing", format!("寻路结束: {err}"));
+                        }
+                        {
+                            let mut cap_guard = capturer.lock().unwrap();
+                            release_idle_capturer(&snapshot, &mut cap_guard, &core);
+                        }
+                        snapshot.task_state = if snapshot.preview_enabled {
+                            TaskState::Previewing
+                        } else {
+                            TaskState::Idle
+                        };
+                        core.publish_snapshot(Arc::new(snapshot.clone()));
+                    }
+                }
             }
             _ = tokio::time::sleep_until(next_capture_at), if snapshot.preview_enabled => {
                 let now = tokio::time::Instant::now();
@@ -364,14 +525,16 @@ async fn run_core_loop(mut core: CoreEndpoint) {
                 } else {
                     next_capture_at + preview_interval
                 };
-                if let Err(err) = capture_once(
-                    &mut snapshot,
-                    &mut capturer,
-                    &pool,
-                    &mut frame_seq,
-                    &mut pace,
-                    &core,
-                ) {
+                if let Ok(mut cap_guard) = capturer.try_lock()
+                    && let Err(err) = capture_once(
+                        &mut snapshot,
+                        &mut cap_guard,
+                        &pool,
+                        &mut frame_seq,
+                        &mut pace,
+                        &core,
+                    )
+                {
                     core.emit_log(LogLevel::Warn, "Capture", format!("抓图停止: {err}"));
                     snapshot.preview_enabled = false;
                     if matches!(snapshot.task_state, TaskState::Previewing) {
@@ -396,9 +559,103 @@ async fn run_core_loop(mut core: CoreEndpoint) {
         }
     }
 
-    drop(capturer);
+    if let Some(cancel) = active_pathing.take() {
+        cancel.store(true, Ordering::Release);
+    }
+    if let Ok(mut guard) = capturer.lock() {
+        *guard = None;
+    }
     drop(raw_hub);
     bgi_input::release_all_keys();
+}
+
+fn stop_active_pathing(
+    snapshot: &mut UiSnapshot,
+    active_pathing: &mut Option<Arc<AtomicBool>>,
+    core: &CoreEndpoint,
+    reason: &str,
+) {
+    if let Some(cancel) = active_pathing.take() {
+        cancel.store(true, Ordering::Release);
+        std::thread::spawn(bgi_input::release_all_keys);
+        core.emit_log(LogLevel::Warn, "Pathing", reason.to_string());
+    }
+    if matches!(snapshot.task_state, TaskState::Pathing { .. }) {
+        snapshot.task_state = if snapshot.preview_enabled {
+            TaskState::Previewing
+        } else {
+            TaskState::Idle
+        };
+    }
+}
+
+fn start_basic_pathing_task(
+    snapshot: &mut UiSnapshot,
+    capturer: &Arc<Mutex<Option<(isize, CaptureMode, CapturerBackend)>>>,
+    pool: &Arc<FrameBufferPool>,
+    cv_ocr: &Arc<Mutex<CvOcrServices>>,
+    active_pathing: &mut Option<Arc<AtomicBool>>,
+    pathing_tx: &mpsc::UnboundedSender<PathingEvent>,
+    core: &CoreEndpoint,
+) -> Result<(), String> {
+    if active_pathing.is_some() {
+        return Err("已有正在执行的寻路任务".to_string());
+    }
+    let Some(win) = &snapshot.selected_window else {
+        return Err("请先在「抓图预览」中选择目标游戏窗口".to_string());
+    };
+    let Some(file) = snapshot.active_path_file.clone() else {
+        return Err("尚未选择路径文件".to_string());
+    };
+    let (summary, task) = bgi_pathing::load_path_file(&file).map_err(|e| e.to_string())?;
+    let total_points = task.positions.len();
+    let task_name = summary.name.clone();
+
+    core.emit_log(
+        LogLevel::Info,
+        "Pathing",
+        format!(
+            "启动基础寻路「{}」：共 {} 个点位，基础可执行 {} 个，跳过复杂动作 [{}]",
+            summary.name,
+            summary.waypoint_count,
+            summary.supported_count,
+            if summary.skipped_actions.is_empty() {
+                "无".to_string()
+            } else {
+                summary.skipped_actions.join(", ")
+            }
+        ),
+    );
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    *active_pathing = Some(cancel.clone());
+    snapshot.task_state = TaskState::Pathing {
+        task_name: task_name.clone(),
+        current_index: 1,
+        total_points,
+    };
+
+    let host_args = CorePathingHost {
+        hwnd: win.hwnd,
+        mode: snapshot.config.capture_mode,
+        cancel,
+        capturer: capturer.clone(),
+        pool: pool.clone(),
+        cv_ocr: cv_ocr.clone(),
+        events_tx: pathing_tx.clone(),
+    };
+
+    std::thread::Builder::new()
+        .name("bgi-pathing-exec".to_string())
+        .spawn(move || {
+            let mut host = host_args;
+            let events_tx = host.events_tx.clone();
+            let res = PathExecutor::run(&mut host, &task_name, &task).map(|()| task_name);
+            let _ = events_tx.send(PathingEvent::Finished(res));
+        })
+        .map_err(|e| format!("启动寻路线程失败: {e}"))?;
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -406,12 +663,14 @@ async fn handle_command(
     cmd: CoreCommand,
     snapshot: &mut UiSnapshot,
     raw_hub: &Option<RawInputHub>,
-    capturer: &mut Option<(isize, CaptureMode, CapturerBackend)>,
-    pool: &FrameBufferPool,
+    capturer: &Arc<Mutex<Option<(isize, CaptureMode, CapturerBackend)>>>,
+    pool: &Arc<FrameBufferPool>,
     frame_seq: &mut u64,
     dbg_seq: &mut u64,
     pace: &mut CapturePaceState,
     cv_ocr: &Arc<Mutex<CvOcrServices>>,
+    active_pathing: &mut Option<Arc<AtomicBool>>,
+    pathing_tx: &mpsc::UnboundedSender<PathingEvent>,
     core: &CoreEndpoint,
 ) -> Result<(), String> {
     match cmd {
@@ -438,7 +697,10 @@ async fn handle_command(
             Ok(())
         }
         CoreCommand::SelectWindow { hwnd } => {
-            close_capturer(capturer, core);
+            {
+                let mut cap_guard = capturer.lock().unwrap();
+                close_capturer(&mut cap_guard, core);
+            }
             snapshot.selected_window = hwnd.and_then(|id| {
                 snapshot.available_windows.iter().find(|w| w.hwnd == id).cloned()
             });
@@ -452,7 +714,10 @@ async fn handle_command(
             Ok(())
         }
         CoreCommand::SetCaptureMode(mode) => {
-            close_capturer(capturer, core);
+            {
+                let mut cap_guard = capturer.lock().unwrap();
+                close_capturer(&mut cap_guard, core);
+            }
             snapshot.config.capture_mode = mode;
             core.emit_log(LogLevel::Info, "Capture", format!("切换截图后端 -> {}", mode.label()));
             Ok(())
@@ -463,14 +728,16 @@ async fn handle_command(
             }
             snapshot.preview_enabled = enabled;
             if !enabled {
-                // Close active capture session cleanly when preview stops so DWM stops pushing frames.
-                close_capturer(capturer, core);
+                let mut cap_guard = capturer.lock().unwrap();
+                release_idle_capturer(snapshot, &mut cap_guard, core);
             }
-            snapshot.task_state = if enabled {
-                TaskState::Previewing
-            } else {
-                TaskState::Idle
-            };
+            if !matches!(snapshot.task_state, TaskState::Pathing { .. }) {
+                snapshot.task_state = if enabled {
+                    TaskState::Previewing
+                } else {
+                    TaskState::Idle
+                };
+            }
             Ok(())
         }
         CoreCommand::SetCaptureNoRender(enabled) => {
@@ -490,19 +757,21 @@ async fn handle_command(
         CoreCommand::SetPreviewFps(fps) => {
             snapshot.config.preview_fps = fps.clamp(1, 60);
             let interval_ms = (1000 / snapshot.config.preview_fps).max(16);
-            let reopen = capturer
+            let mut cap_guard = capturer.lock().unwrap();
+            let reopen = cap_guard
                 .as_ref()
                 .is_some_and(|(_, _, backend)| backend.needs_reopen_for_interval(interval_ms));
             if reopen {
-                close_capturer(capturer, core);
-            } else if let Some((_, _, backend)) = capturer.as_ref() {
+                close_capturer(&mut cap_guard, core);
+            } else if let Some((_, _, backend)) = cap_guard.as_ref() {
                 backend.set_min_update_interval_ms(interval_ms);
             }
             Ok(())
         }
         CoreCommand::CaptureSingleFrame => {
-            let res = capture_once(snapshot, capturer, pool, frame_seq, pace, core);
-            release_idle_capturer(snapshot, capturer, core);
+            let mut cap_guard = capturer.lock().unwrap();
+            let res = capture_once(snapshot, &mut cap_guard, pool, frame_seq, pace, core);
+            release_idle_capturer(snapshot, &mut cap_guard, core);
             res
         }
         CoreCommand::SetPathingDir(dir) => {
@@ -541,16 +810,26 @@ async fn handle_command(
             Ok(())
         }
         CoreCommand::ProbeMiniMapCv => {
-            let captured = capture_raw_bgra(snapshot, capturer, pool, core);
-            release_idle_capturer(snapshot, capturer, core);
-            let Some((w, h, buf)) = captured? else {
+            let captured = {
+                let mut cap_guard = capturer.lock().unwrap();
+                let res = capture_raw_frame(snapshot, &mut cap_guard, pool, core);
+                release_idle_capturer(snapshot, &mut cap_guard, core);
+                res
+            };
+            let Some(frame) = captured? else {
                 return Err("当前帧尚未就绪".to_string());
             };
             *dbg_seq += 1;
             let seq = *dbg_seq;
             let cv = cv_ocr.clone();
             let res = tokio::task::spawn_blocking(move || {
-                cv.lock().unwrap().probe_minimap(buf.as_slice(), w, h, seq)
+                cv.lock().unwrap().probe_minimap(
+                    frame.data.as_slice(),
+                    frame.width,
+                    frame.height,
+                    frame.format.is_bgr24(),
+                    seq,
+                )
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -566,16 +845,26 @@ async fn handle_command(
             Ok(())
         }
         CoreCommand::ProbeBigMapSift => {
-            let captured = capture_raw_bgra(snapshot, capturer, pool, core);
-            release_idle_capturer(snapshot, capturer, core);
-            let Some((w, h, buf)) = captured? else {
+            let captured = {
+                let mut cap_guard = capturer.lock().unwrap();
+                let res = capture_raw_frame(snapshot, &mut cap_guard, pool, core);
+                release_idle_capturer(snapshot, &mut cap_guard, core);
+                res
+            };
+            let Some(frame) = captured? else {
                 return Err("当前帧尚未就绪".to_string());
             };
             *dbg_seq += 1;
             let seq = *dbg_seq;
             let cv = cv_ocr.clone();
             let res = tokio::task::spawn_blocking(move || {
-                cv.lock().unwrap().probe_bigmap_sift(buf.as_slice(), w, h, seq)
+                cv.lock().unwrap().probe_bigmap_sift(
+                    frame.data.as_slice(),
+                    frame.width,
+                    frame.height,
+                    frame.format.is_bgr24(),
+                    seq,
+                )
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -588,16 +877,26 @@ async fn handle_command(
             Ok(())
         }
         CoreCommand::ProbeOcrScreen => {
-            let captured = capture_raw_bgra(snapshot, capturer, pool, core);
-            release_idle_capturer(snapshot, capturer, core);
-            let Some((w, h, buf)) = captured? else {
+            let captured = {
+                let mut cap_guard = capturer.lock().unwrap();
+                let res = capture_raw_frame(snapshot, &mut cap_guard, pool, core);
+                release_idle_capturer(snapshot, &mut cap_guard, core);
+                res
+            };
+            let Some(frame) = captured? else {
                 return Err("当前帧尚未就绪".to_string());
             };
             *dbg_seq += 1;
             let seq = *dbg_seq;
             let cv = cv_ocr.clone();
             let res = tokio::task::spawn_blocking(move || {
-                cv.lock().unwrap().probe_ocr(buf.as_slice(), w, h, seq)
+                cv.lock().unwrap().probe_ocr(
+                    frame.data.as_slice(),
+                    frame.width,
+                    frame.height,
+                    frame.format.is_bgr24(),
+                    seq,
+                )
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -647,36 +946,26 @@ async fn handle_command(
             );
             Ok(())
         }
-        CoreCommand::StartBasicPathing => {
-            let Some(file) = snapshot.active_path_file.clone() else {
-                return Err("尚未选择路径文件".to_string());
-            };
-            let (summary, _task) = bgi_pathing::load_path_file(&file).map_err(|e| e.to_string())?;
-            core.emit_log(
-                LogLevel::Info,
-                "Pathing",
-                format!(
-                    "已加载基础路径「{}」：共 {} 个点位，基础可执行 {} 个，将跳过复杂动作 [{}]",
-                    summary.name,
-                    summary.waypoint_count,
-                    summary.supported_count,
-                    if summary.skipped_actions.is_empty() {
-                        "无".to_string()
-                    } else {
-                        summary.skipped_actions.join(", ")
-                    }
-                ),
-            );
-            core.emit_log(
-                LogLevel::Warn,
-                "Pathing",
-                "Phase 2 CV/OCR 已接通；Phase 3 将接入 TpTask 传送与 PathExecutor 实机闭环移动控制。",
-            );
+        CoreCommand::StartBasicPathing => start_basic_pathing_task(
+            snapshot,
+            capturer,
+            pool,
+            cv_ocr,
+            active_pathing,
+            pathing_tx,
+            core,
+        ),
+        CoreCommand::StopPathing => {
+            stop_active_pathing(snapshot, active_pathing, core, "已请求停止当前寻路任务");
             Ok(())
         }
         CoreCommand::EmergencyStop => {
             snapshot.preview_enabled = false;
-            close_capturer(capturer, core);
+            stop_active_pathing(snapshot, active_pathing, core, "急停中断正在执行的寻路任务");
+            {
+                let mut cap_guard = capturer.lock().unwrap();
+                close_capturer(&mut cap_guard, core);
+            }
             snapshot.task_state = TaskState::Idle;
             tokio::task::spawn_blocking(bgi_input::release_all_keys)
                 .await
@@ -686,6 +975,7 @@ async fn handle_command(
         }
         CoreCommand::ShutdownCore => {
             snapshot.preview_enabled = false;
+            stop_active_pathing(snapshot, active_pathing, core, "核心退出，终止寻路任务");
             snapshot.task_state = TaskState::Idle;
             core.emit_log(LogLevel::Info, "Core", "正在关闭后台核心...");
             Ok(())
@@ -693,11 +983,16 @@ async fn handle_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_raw_signal(
     sig: RawInputSignal,
     snapshot: &mut UiSnapshot,
     raw_hub: &Option<RawInputHub>,
-    capturer: &mut Option<(isize, CaptureMode, CapturerBackend)>,
+    capturer: &Arc<Mutex<Option<(isize, CaptureMode, CapturerBackend)>>>,
+    pool: &Arc<FrameBufferPool>,
+    cv_ocr: &Arc<Mutex<CvOcrServices>>,
+    active_pathing: &mut Option<Arc<AtomicBool>>,
+    pathing_tx: &mpsc::UnboundedSender<PathingEvent>,
     core: &CoreEndpoint,
 ) {
     match sig {
@@ -757,7 +1052,11 @@ fn handle_raw_signal(
             match action {
                 HotkeyAction::EmergencyStop => {
                     snapshot.preview_enabled = false;
-                    close_capturer(capturer, core);
+                    stop_active_pathing(snapshot, active_pathing, core, "全局急停中断寻路");
+                    {
+                        let mut cap_guard = capturer.lock().unwrap();
+                        close_capturer(&mut cap_guard, core);
+                    }
                     snapshot.task_state = TaskState::Idle;
                     std::thread::spawn(bgi_input::release_all_keys);
                 }
@@ -765,16 +1064,34 @@ fn handle_raw_signal(
                     if snapshot.selected_window.is_some() {
                         snapshot.preview_enabled = !snapshot.preview_enabled;
                         if !snapshot.preview_enabled {
-                            close_capturer(capturer, core);
+                            let mut cap_guard = capturer.lock().unwrap();
+                            release_idle_capturer(snapshot, &mut cap_guard, core);
                         }
-                        snapshot.task_state = if snapshot.preview_enabled {
-                            TaskState::Previewing
-                        } else {
-                            TaskState::Idle
-                        };
+                        if !matches!(snapshot.task_state, TaskState::Pathing { .. }) {
+                            snapshot.task_state = if snapshot.preview_enabled {
+                                TaskState::Previewing
+                            } else {
+                                TaskState::Idle
+                            };
+                        }
                     }
                 }
-                HotkeyAction::StartStopPathing | HotkeyAction::TestPing => {}
+                HotkeyAction::StartStopPathing => {
+                    if active_pathing.is_some() {
+                        stop_active_pathing(snapshot, active_pathing, core, "热键触发停止寻路");
+                    } else if let Err(err) = start_basic_pathing_task(
+                        snapshot,
+                        capturer,
+                        pool,
+                        cv_ocr,
+                        active_pathing,
+                        pathing_tx,
+                        core,
+                    ) {
+                        core.emit_log(LogLevel::Warn, "Pathing", format!("无法启动寻路: {err}"));
+                    }
+                }
+                HotkeyAction::TestPing => {}
             }
         }
     }
@@ -785,9 +1102,9 @@ fn close_capturer(
     core: &CoreEndpoint,
 ) {
     if let Some((_, _, backend)) = capturer.take()
-        && let Some(diag) = backend.wgc_diagnostics()
+        && let Some(diag) = backend.diagnostics()
     {
-        core.emit_log(LogLevel::Info, "WGC", format!("会话关闭: {diag}"));
+        core.emit_log(LogLevel::Info, "Capture", format!("会话关闭: {diag}"));
     }
 }
 
@@ -801,12 +1118,11 @@ fn release_idle_capturer(
     }
 }
 
-fn capture_raw_bgra(
+fn ensure_capturer<'a>(
     snapshot: &UiSnapshot,
-    capturer: &mut Option<(isize, CaptureMode, CapturerBackend)>,
-    pool: &FrameBufferPool,
+    capturer: &'a mut Option<(isize, CaptureMode, CapturerBackend)>,
     core: &CoreEndpoint,
-) -> Result<Option<(u32, u32, PooledBuffer)>, String> {
+) -> Result<&'a mut CapturerBackend, String> {
     let Some(win) = &snapshot.selected_window else {
         return Err("尚未选择目标窗口".to_string());
     };
@@ -821,13 +1137,22 @@ fn capture_raw_bgra(
         close_capturer(capturer, core);
         let interval_ms = (1000 / snapshot.config.preview_fps.clamp(1, 60)).max(16);
         let backend = CapturerBackend::open(win.hwnd, mode, interval_ms).map_err(|e| e.to_string())?;
-        if let Some(diag) = backend.wgc_diagnostics() {
-            core.emit_log(LogLevel::Info, "WGC", format!("会话启动: {diag}"));
+        if let Some(diag) = backend.diagnostics() {
+            core.emit_log(LogLevel::Info, "Capture", format!("会话启动: {diag}"));
         }
         *capturer = Some((win.hwnd, mode, backend));
     }
 
-    let (_, _, backend) = capturer.as_mut().unwrap();
+    Ok(&mut capturer.as_mut().unwrap().2)
+}
+
+fn capture_raw_frame(
+    snapshot: &UiSnapshot,
+    capturer: &mut Option<(isize, CaptureMode, CapturerBackend)>,
+    pool: &FrameBufferPool,
+    core: &CoreEndpoint,
+) -> Result<Option<CapturedFrame>, String> {
+    let backend = ensure_capturer(snapshot, capturer, core)?;
     match backend.capture(pool) {
         Ok(res) => Ok(Some(res)),
         Err(bgi_capture::CaptureError::FrameNotReady) => Ok(None),
@@ -862,6 +1187,26 @@ impl CapturePaceState {
     }
 }
 
+fn record_capture_stats(
+    snapshot: &mut UiSnapshot,
+    pace: &mut CapturePaceState,
+    sw: u32,
+    sh: u32,
+    capture_ms: f32,
+) {
+    pace.window_frames += 1;
+    let elapsed = pace.window_start.elapsed();
+    if elapsed >= Duration::from_millis(500) {
+        snapshot.capture_stats.measured_fps = (pace.window_frames as f32) / elapsed.as_secs_f32();
+        pace.window_start = Instant::now();
+        pace.window_frames = 0;
+    }
+    snapshot.capture_stats.captured_frames += 1;
+    snapshot.capture_stats.source_width = sw;
+    snapshot.capture_stats.source_height = sh;
+    snapshot.capture_stats.last_capture_ms = capture_ms;
+}
+
 fn capture_once(
     snapshot: &mut UiSnapshot,
     capturer: &mut Option<(isize, CaptureMode, CapturerBackend)>,
@@ -871,26 +1216,16 @@ fn capture_once(
     core: &CoreEndpoint,
 ) -> Result<(), String> {
     let started = Instant::now();
-    let Some((w, h, buf)) = capture_raw_bgra(snapshot, capturer, pool, core)? else {
+
+    let Some(frame) = capture_raw_frame(snapshot, capturer, pool, core)? else {
         return Ok(());
     };
     let capture_ms = started.elapsed().as_secs_f32() * 1000.0;
-
-    pace.window_frames += 1;
-    let elapsed = pace.window_start.elapsed();
-    if elapsed >= Duration::from_millis(500) {
-        snapshot.capture_stats.measured_fps = (pace.window_frames as f32) / elapsed.as_secs_f32();
-        pace.window_start = Instant::now();
-        pace.window_frames = 0;
-    }
-    snapshot.capture_stats.captured_frames += 1;
-    snapshot.capture_stats.source_width = w;
-    snapshot.capture_stats.source_height = h;
-    snapshot.capture_stats.last_capture_ms = capture_ms;
+    record_capture_stats(snapshot, pace, frame.width, frame.height, capture_ms);
 
     if snapshot.config.capture_only_no_render {
         // Return buffer to pool immediately; skip CPU scaling and UI texture upload.
-        drop(buf);
+        drop(frame);
         if pace.last_stats_publish.elapsed() >= Duration::from_secs(1) {
             pace.last_stats_publish = Instant::now();
             core.publish_snapshot(Arc::new(snapshot.clone()));
@@ -899,7 +1234,7 @@ fn capture_once(
     }
 
     *frame_seq += 1;
-    let preview = bgra_to_preview(*frame_seq, w, h, buf.as_slice(), 960, 540, capture_ms);
+    let preview = frame_to_preview(*frame_seq, &frame, 960, 540, capture_ms);
     core.publish_preview(preview);
     Ok(())
 }

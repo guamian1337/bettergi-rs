@@ -8,4 +8,3 @@ license.workspace = true
 bgi-control = { path = "../bgi-control" }
 thiserror.workspace = true
 windows.workspace = true
-windows-capture = "2.0.1"

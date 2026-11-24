@@ -1,9 +1,59 @@
+use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT,
-    MapVirtualKeyW, SendInput, VIRTUAL_KEY,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, MOUSE_EVENT_FLAGS,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, IsIconic, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SW_RESTORE, SetForegroundWindow, ShowWindow,
+};
+
+const WHEEL_DELTA_NOTCH: i32 = 120;
+
+fn send_mouse(dw_flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, mouse_data: u32) {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: mouse_data,
+                dwFlags: dw_flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe {
+        let _ = SendInput(&[input], size_of::<INPUT>() as i32);
+    }
+}
+
+pub fn focus_window(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    let h = HWND(hwnd as *mut _);
+    unsafe {
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(h);
+    }
+}
+
+pub fn window_dpi_scale(hwnd: isize) -> f32 {
+    if hwnd == 0 {
+        return 1.0;
+    }
+    let dpi = unsafe { GetDpiForWindow(HWND(hwnd as *mut _)) };
+    if dpi == 0 { 1.0 } else { (dpi as f32) / 96.0 }
+}
 
 /// Matches `BetterGenshinImpact/Core/Simulator/ExtendedKeys.cs` hardware behavior.
 pub fn is_extended_key(vk: u16) -> bool {
@@ -48,74 +98,89 @@ pub fn key_tap(vk: u16, hold_ms: u64) {
 }
 
 pub fn mouse_move_rel(dx: i32, dy: i32) {
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx,
-                dy,
-                mouseData: 0,
-                dwFlags: MOUSEEVENTF_MOVE,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-    unsafe {
-        let _ = SendInput(&[input], size_of::<INPUT>() as i32);
+    send_mouse(MOUSEEVENTF_MOVE, dx, dy, 0);
+}
+
+pub fn mouse_move_to_client(hwnd: isize, client_x: i32, client_y: i32) {
+    if hwnd == 0 {
+        return;
     }
+    let mut pt = POINT {
+        x: client_x,
+        y: client_y,
+    };
+    if unsafe { !ClientToScreen(HWND(hwnd as *mut _), &mut pt).as_bool() } {
+        return;
+    }
+    let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+    let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+
+    let norm_x = ((((pt.x - vx) as f64) * 65535.0) / ((vw - 1).max(1) as f64))
+        .round()
+        .clamp(0.0, 65535.0) as i32;
+    let norm_y = ((((pt.y - vy) as f64) * 65535.0) / ((vh - 1).max(1) as f64))
+        .round()
+        .clamp(0.0, 65535.0) as i32;
+    send_mouse(
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        norm_x,
+        norm_y,
+        0,
+    );
+}
+
+pub fn mouse_left_down() {
+    send_mouse(MOUSEEVENTF_LEFTDOWN, 0, 0, 0);
+}
+
+pub fn mouse_left_up() {
+    send_mouse(MOUSEEVENTF_LEFTUP, 0, 0, 0);
 }
 
 pub fn mouse_left_click() {
-    let inputs = [
-        INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dwFlags: MOUSEEVENTF_LEFTDOWN,
-                    ..Default::default()
-                },
-            },
-        },
-        INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dwFlags: MOUSEEVENTF_LEFTUP,
-                    ..Default::default()
-                },
-            },
-        },
-    ];
-    unsafe {
-        let _ = SendInput(&inputs, size_of::<INPUT>() as i32);
+    mouse_left_down();
+    mouse_left_up();
+}
+
+pub fn mouse_left_click_client(hwnd: isize, client_x: i32, client_y: i32) {
+    mouse_move_to_client(hwnd, client_x, client_y);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    mouse_left_click();
+}
+
+pub fn mouse_drag_client(hwnd: isize, x1: i32, y1: i32, x2: i32, y2: i32) {
+    mouse_move_to_client(hwnd, x1, y1);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    mouse_left_down();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    const STEPS: i32 = 4;
+    for step in 1..=STEPS {
+        let sx = x1 + ((x2 - x1) * step) / STEPS;
+        let sy = y1 + ((y2 - y1) * step) / STEPS;
+        mouse_move_to_client(hwnd, sx, sy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    mouse_left_up();
+    std::thread::sleep(std::time::Duration::from_millis(60));
+}
+
+pub fn mouse_wheel(notches: i32) {
+    if notches == 0 {
+        return;
+    }
+    send_mouse(
+        MOUSEEVENTF_WHEEL,
+        0,
+        0,
+        (notches.saturating_mul(WHEEL_DELTA_NOTCH)) as u32,
+    );
 }
 
 pub fn mouse_right_click() {
-    let inputs = [
-        INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dwFlags: MOUSEEVENTF_RIGHTDOWN,
-                    ..Default::default()
-                },
-            },
-        },
-        INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dwFlags: MOUSEEVENTF_RIGHTUP,
-                    ..Default::default()
-                },
-            },
-        },
-    ];
-    unsafe {
-        let _ = SendInput(&inputs, size_of::<INPUT>() as i32);
-    }
+    send_mouse(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0);
+    send_mouse(MOUSEEVENTF_RIGHTUP, 0, 0, 0);
 }
 
 /// Releases common movement/modifier keys and mouse buttons on emergency stop.

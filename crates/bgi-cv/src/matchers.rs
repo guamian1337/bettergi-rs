@@ -7,6 +7,40 @@ use opencv::prelude::MatExprTraitConst;
 
 use crate::CvError;
 
+/// Wraps tightly packed `BGR24` bytes directly into an OpenCV `CV_8UC3` `Mat` without color conversion.
+pub fn bgr_to_mat(bgr: &[u8], width: u32, height: u32) -> Result<Mat, CvError> {
+    let expected = (width as usize) * (height as usize) * 3;
+    if width == 0 || height == 0 || bgr.len() < expected {
+        return Err(CvError::InvalidImage(format!(
+            "期望至少 {expected} 字节 BGR24 ({width}x{height})，实际 {}",
+            bgr.len()
+        )));
+    }
+    let view = unsafe {
+        Mat::new_rows_cols_with_data_unsafe(
+            height as i32,
+            width as i32,
+            core::CV_8UC3,
+            bgr.as_ptr() as *mut std::ffi::c_void,
+            (width as usize) * 3,
+        )
+    }?;
+    Ok(view.try_clone()?)
+}
+
+pub fn frame_to_bgr_mat(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    is_bgr24: bool,
+) -> Result<Mat, CvError> {
+    if is_bgr24 {
+        bgr_to_mat(bytes, width, height)
+    } else {
+        bgra_to_bgr_mat(bytes, width, height)
+    }
+}
+
 pub fn bgra_to_bgr_mat(bgra: &[u8], width: u32, height: u32) -> Result<Mat, CvError> {
     let expected = (width as usize) * (height as usize) * 4;
     if width == 0 || height == 0 || bgra.len() < expected {
@@ -467,5 +501,18 @@ mod tests {
 
         assert_eq!(loc, Point::new(34, 41));
         assert!((val + sum_sq).abs() / sum_sq.max(1.0) < 1e-5);
+    }
+
+    #[test]
+    fn bgr24_mat_matches_bgra_conversion() {
+        let bgra = vec![
+            11, 22, 33, 255, 44, 55, 66, 128, 77, 88, 99, 0, 10, 20, 30, 200,
+        ];
+        let bgr = vec![
+            11, 22, 33, 44, 55, 66, 77, 88, 99, 10, 20, 30,
+        ];
+        let m_from_bgra = frame_to_bgr_mat(&bgra, 2, 2, false).unwrap();
+        let m_from_bgr = frame_to_bgr_mat(&bgr, 2, 2, true).unwrap();
+        assert_eq!(m_from_bgra.data_bytes().unwrap(), m_from_bgr.data_bytes().unwrap());
     }
 }

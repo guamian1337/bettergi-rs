@@ -1,4 +1,5 @@
 mod core;
+mod pathing_host;
 mod tray;
 mod ui_host;
 

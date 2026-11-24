@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use bgi_cv::matchers::bgra_to_bgr_mat;
+use bgi_cv::matchers::frame_to_bgr_mat;
 use opencv::core::{
     self, BORDER_REPLICATE, CMP_GT, CV_8UC1, Mat, MatTraitConst, MatTraitConstManual, Point,
-    Point2f, RotatedRect, Scalar, Size, Vector,
+    Point2f, Rect, RotatedRect, Scalar, Size, Vector,
 };
 use opencv::imgproc::{
     self, CHAIN_APPROX_SIMPLE, INTER_CUBIC, INTER_LINEAR, RETR_LIST, fill_poly,
@@ -239,11 +239,52 @@ impl PaddleOcrEngine {
             regions,
         })
     }
+
+    /// Runs OCR inside a normalized `[0..1]` rectangle `(norm_x0, norm_y0)..(norm_x1, norm_y1)`
+    /// and returns `(origin_x, origin_y, OcrResult)` in full-frame coordinates.
+    pub fn recognize_frame_roi(
+        &mut self,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        is_bgr24: bool,
+        norm_x0: f32,
+        norm_y0: f32,
+        norm_x1: f32,
+        norm_y1: f32,
+    ) -> Result<(i32, i32, OcrResult), InferError> {
+        let full_bgr = frame_to_bgr_mat(bytes, width, height, is_bgr24)?;
+        let iw = full_bgr.cols().max(1);
+        let ih = full_bgr.rows().max(1);
+        let x0 = ((norm_x0.clamp(0.0, 1.0) * iw as f32).floor() as i32).clamp(0, iw - 1);
+        let y0 = ((norm_y0.clamp(0.0, 1.0) * ih as f32).floor() as i32).clamp(0, ih - 1);
+        let x1 = ((norm_x1.clamp(0.0, 1.0) * iw as f32).ceil() as i32).clamp(x0 + 1, iw);
+        let y1 = ((norm_y1.clamp(0.0, 1.0) * ih as f32).ceil() as i32).clamp(y0 + 1, ih);
+
+        let view = Mat::roi(&full_bgr, Rect::new(x0, y0, x1 - x0, y1 - y0))
+            .map_err(|e| InferError::Runtime(e.message))?;
+        let contiguous = view.try_clone().map_err(|e| InferError::Runtime(e.message))?;
+        let res = self.recognize_bgr_mat(&contiguous)?;
+        Ok((x0, y0, res))
+    }
+
+    pub fn recognize_bgra_roi(
+        &mut self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+        norm_x0: f32,
+        norm_y0: f32,
+        norm_x1: f32,
+        norm_y1: f32,
+    ) -> Result<(i32, i32, OcrResult), InferError> {
+        self.recognize_frame_roi(bgra, width, height, false, norm_x0, norm_y0, norm_x1, norm_y1)
+    }
 }
 
 impl OcrService for PaddleOcrEngine {
     fn recognize_bgra(&mut self, bgra: &[u8], width: u32, height: u32) -> Result<OcrResult, InferError> {
-        let bgr = bgra_to_bgr_mat(bgra, width, height)?;
+        let bgr = frame_to_bgr_mat(bgra, width, height, false)?;
         self.recognize_bgr_mat(&bgr)
     }
 

@@ -1,4 +1,6 @@
 pub mod bitblt;
+pub mod dwm_shared;
+pub mod gpu_bgr;
 pub mod pool;
 pub mod wgc;
 pub mod windows_enum;
@@ -7,9 +9,29 @@ use bgi_control::{CaptureMode, FramePreview};
 use thiserror::Error;
 
 pub use bitblt::BitBltCapturer;
+pub use dwm_shared::DwmSharedCapturer;
 pub use pool::{FrameBufferPool, PooledBuffer};
 pub use wgc::WgcCapturer;
 pub use windows_enum::enumerate_candidate_windows;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    Bgra32,
+    Bgr24,
+}
+
+impl PixelFormat {
+    pub fn is_bgr24(self) -> bool {
+        matches!(self, Self::Bgr24)
+    }
+}
+
+pub struct CapturedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    pub data: PooledBuffer,
+}
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -26,6 +48,7 @@ pub enum CaptureError {
 pub enum CapturerBackend {
     BitBlt(BitBltCapturer),
     Wgc(WgcCapturer),
+    DwmShared(DwmSharedCapturer),
 }
 
 impl CapturerBackend {
@@ -33,6 +56,7 @@ impl CapturerBackend {
         match mode {
             CaptureMode::BitBlt => Ok(Self::BitBlt(BitBltCapturer::new(hwnd)?)),
             CaptureMode::Wgc => Ok(Self::Wgc(WgcCapturer::new(hwnd, min_update_interval_ms)?)),
+            CaptureMode::DwmSharedSurface => Ok(Self::DwmShared(DwmSharedCapturer::new(hwnd)?)),
         }
     }
 
@@ -44,24 +68,126 @@ impl CapturerBackend {
 
     pub fn needs_reopen_for_interval(&self, min_update_interval_ms: u32) -> bool {
         match self {
-            Self::BitBlt(_) => false,
             Self::Wgc(wgc) => wgc.needs_reopen_for_interval(min_update_interval_ms),
+            Self::BitBlt(_) | Self::DwmShared(_) => false,
         }
     }
 
-    pub fn wgc_diagnostics(&self) -> Option<String> {
+    pub fn diagnostics(&self) -> Option<String> {
         match self {
             Self::BitBlt(_) => None,
             Self::Wgc(wgc) => Some(wgc.diagnostics_summary()),
+            Self::DwmShared(d) => Some(d.diagnostics_summary()),
         }
     }
 
-    pub fn capture(&mut self, pool: &FrameBufferPool) -> Result<(u32, u32, PooledBuffer), CaptureError> {
+    pub fn capture(&mut self, pool: &FrameBufferPool) -> Result<CapturedFrame, CaptureError> {
         match self {
-            Self::BitBlt(c) => c.capture(pool),
-            Self::Wgc(c) => c.capture(pool),
+            Self::BitBlt(c) => {
+                let (width, height, data) = c.capture(pool)?;
+                Ok(CapturedFrame {
+                    width,
+                    height,
+                    format: PixelFormat::Bgra32,
+                    data,
+                })
+            }
+            Self::Wgc(c) => {
+                let (width, height, data) = c.capture_bgr(pool)?;
+                Ok(CapturedFrame {
+                    width,
+                    height,
+                    format: PixelFormat::Bgr24,
+                    data,
+                })
+            }
+            Self::DwmShared(d) => {
+                let (width, height, data) = d.capture_bgr(pool)?;
+                Ok(CapturedFrame {
+                    width,
+                    height,
+                    format: PixelFormat::Bgr24,
+                    data,
+                })
+            }
         }
     }
+
+    pub fn capture_roi(
+        &mut self,
+        pool: &FrameBufferPool,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<CapturedFrame, CaptureError> {
+        match self {
+            Self::Wgc(c) => {
+                let (rw, rh, data) = c.capture_bgr_roi(pool, x, y, width, height)?;
+                Ok(CapturedFrame {
+                    width: rw,
+                    height: rh,
+                    format: PixelFormat::Bgr24,
+                    data,
+                })
+            }
+            Self::DwmShared(d) => {
+                let (rw, rh, data) = d.capture_bgr_roi(pool, x, y, width, height)?;
+                Ok(CapturedFrame {
+                    width: rw,
+                    height: rh,
+                    format: PixelFormat::Bgr24,
+                    data,
+                })
+            }
+            Self::BitBlt(c) => {
+                let (fw, fh, full) = c.capture(pool)?;
+                if fw == 0 || fh == 0 || width == 0 || height == 0 {
+                    return Err(CaptureError::Api("ROI 宽高不能为 0".into()));
+                }
+                let rx = x.min(fw - 1);
+                let ry = y.min(fh - 1);
+                let rw = width.min(fw - rx).max(1);
+                let rh = height.min(fh - ry).max(1);
+                let mut out = pool.checkout((rw as usize) * (rh as usize) * 4);
+                let src = full.as_slice();
+                let dst = out.as_mut_slice();
+                let row_bytes = (rw as usize) * 4;
+                let src_stride = (fw as usize) * 4;
+                for row in 0..(rh as usize) {
+                    let s_off = ((ry as usize) + row) * src_stride + (rx as usize) * 4;
+                    let d_off = row * row_bytes;
+                    dst[d_off..d_off + row_bytes].copy_from_slice(&src[s_off..s_off + row_bytes]);
+                }
+                Ok(CapturedFrame {
+                    width: rw,
+                    height: rh,
+                    format: PixelFormat::Bgra32,
+                    data: out,
+                })
+            }
+        }
+    }
+}
+
+/// Converts a captured `BGR24` or `BGRA32` buffer into a downsampled `RGBA` `FramePreview`.
+pub fn frame_to_preview(
+    seq: u64,
+    frame: &CapturedFrame,
+    max_w: u32,
+    max_h: u32,
+    capture_ms: f32,
+) -> FramePreview {
+    pixels_to_preview(
+        seq,
+        frame.width,
+        frame.height,
+        frame.data.as_slice(),
+        frame.format,
+        max_w,
+        max_h,
+        capture_ms,
+    )
 }
 
 /// Converts BGRA buffer into downsampled RGBA `FramePreview` on the background thread.
@@ -74,7 +200,33 @@ pub fn bgra_to_preview(
     max_h: u32,
     capture_ms: f32,
 ) -> FramePreview {
-    if src_w == 0 || src_h == 0 || bgra.len() < (src_w as usize) * (src_h as usize) * 4 {
+    pixels_to_preview(
+        seq,
+        src_w,
+        src_h,
+        bgra,
+        PixelFormat::Bgra32,
+        max_w,
+        max_h,
+        capture_ms,
+    )
+}
+
+fn pixels_to_preview(
+    seq: u64,
+    src_w: u32,
+    src_h: u32,
+    pixels: &[u8],
+    format: PixelFormat,
+    max_w: u32,
+    max_h: u32,
+    capture_ms: f32,
+) -> FramePreview {
+    let bpp = match format {
+        PixelFormat::Bgra32 => 4usize,
+        PixelFormat::Bgr24 => 3usize,
+    };
+    if src_w == 0 || src_h == 0 || pixels.len() < (src_w as usize) * (src_h as usize) * bpp {
         return FramePreview {
             seq,
             width: 1,
@@ -94,14 +246,14 @@ pub fn bgra_to_preview(
     let dst_h = ((src_h as f32) * scale).round().max(1.0) as u32;
 
     let sx_lut: Vec<usize> = (0..dst_w)
-        .map(|dx| (((dx as u64) * (src_w as u64) / (dst_w as u64)).min((src_w - 1) as u64) as usize) * 4)
+        .map(|dx| (((dx as u64) * (src_w as u64) / (dst_w as u64)).min((src_w - 1) as u64) as usize) * bpp)
         .collect();
-    let src_stride = (src_w as usize) * 4;
+    let src_stride = (src_w as usize) * bpp;
     let dst_stride = (dst_w as usize) * 4;
     let mut rgba = vec![0u8; dst_stride * (dst_h as usize)];
     for dy in 0..dst_h {
         let sy = ((dy as u64) * (src_h as u64) / (dst_h as u64)).min((src_h - 1) as u64) as usize;
-        let src_row = &bgra[sy * src_stride..(sy + 1) * src_stride];
+        let src_row = &pixels[sy * src_stride..(sy + 1) * src_stride];
         let dst_row = &mut rgba[(dy as usize) * dst_stride..((dy as usize) + 1) * dst_stride];
         for (dx, &sx_off) in sx_lut.iter().enumerate() {
             let d_off = dx * 4;
@@ -129,16 +281,32 @@ mod tests {
 
     #[test]
     fn bgra_preview_swaps_channels_and_downsamples() {
-        let mut bgra = vec![0u8; 4 * 4 * 4];
-        // Pixel (0, 0): B=10, G=20, R=30, A=0 -> RGBA (30, 20, 10, 255)
-        bgra[0] = 10;
-        bgra[1] = 20;
-        bgra[2] = 30;
-        bgra[3] = 0;
-
-        let preview = bgra_to_preview(7, 4, 4, &bgra, 2, 2, 1.5);
+        let bgra = vec![
+            10, 20, 30, 0, // (0,0) B=10,G=20,R=30
+            40, 50, 60, 0, // (1,0)
+            70, 80, 90, 0, // (0,1)
+            100, 110, 120, 0, // (1,1)
+        ];
+        let preview = bgra_to_preview(7, 2, 2, &bgra, 2, 2, 1.5);
+        assert_eq!(preview.seq, 7);
         assert_eq!(preview.width, 2);
         assert_eq!(preview.height, 2);
+        assert_eq!(&preview.rgba[0..4], &[30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn bgr24_preview_swaps_channels_without_alpha() {
+        let bgr = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let pool = FrameBufferPool::new(1);
+        let mut buf = pool.checkout(bgr.len());
+        buf.as_mut_slice().copy_from_slice(&bgr);
+        let frame = CapturedFrame {
+            width: 2,
+            height: 2,
+            format: PixelFormat::Bgr24,
+            data: buf,
+        };
+        let preview = frame_to_preview(3, &frame, 2, 2, 0.5);
         assert_eq!(&preview.rgba[0..4], &[30, 20, 10, 255]);
     }
 }

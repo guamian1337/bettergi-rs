@@ -11,13 +11,15 @@ pub enum CaptureMode {
     #[default]
     BitBlt,
     Wgc,
+    DwmSharedSurface,
 }
 
 impl CaptureMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::BitBlt => "BitBlt",
-            Self::Wgc => "Windows.Graphics.Capture (WGC)",
+            Self::Wgc => "WGC (自研双缓冲)",
+            Self::DwmSharedSurface => "DwmSharedSurface (无WGC)",
         }
     }
 }
@@ -344,6 +346,7 @@ pub enum CoreCommand {
     UpdateHotkey(HotkeyBinding),
     TestInputKey { vk: u16 },
     StartBasicPathing,
+    StopPathing,
     EmergencyStop,
     ShutdownCore,
 }

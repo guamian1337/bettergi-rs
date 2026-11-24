@@ -115,8 +115,11 @@ impl BigMapSiftMatcher {
         self.train_pts.len()
     }
 
-    /// Locates big-map screenshot (grayscale or BGR) and returns `(game_x, game_y)` plus `inliers`.
-    pub fn locate_big_map(&mut self, frame_bgr_or_gray: &Mat) -> Result<(f32, f32, usize), CvError> {
+    /// Big-map SIFT match with projected viewport bounds in Genshin world coordinates.
+    pub fn locate_big_map_rect(&mut self, frame_bgr_or_gray: &Mat) -> Result<BigMapRectMatch, CvError> {
+        let frame_width = frame_bgr_or_gray.cols().max(1) as u32;
+        let frame_height = frame_bgr_or_gray.rows().max(1) as u32;
+
         let mut gray = Mat::default();
         if frame_bgr_or_gray.channels() == 3 {
             imgproc::cvt_color(
@@ -187,18 +190,54 @@ impl BigMapSiftMatcher {
             inliers = mask_bytes.iter().filter(|&&b| b != 0).count();
         }
 
-        let mut center_in = Vector::<Point2f>::new();
-        center_in.push(Point2f::new(resized.cols() as f32 / 2.0, resized.rows() as f32 / 2.0));
-        let mut center_out = Vector::<Point2f>::new();
-        core::perspective_transform(&center_in, &mut center_out, &h_mat)?;
-        let pos256 = center_out.get(0)?;
+        let mut pts_in = Vector::<Point2f>::new();
+        pts_in.push(Point2f::new(0.0, 0.0));
+        pts_in.push(Point2f::new(resized.cols() as f32 / 2.0, resized.rows() as f32 / 2.0));
+        pts_in.push(Point2f::new(resized.cols() as f32, resized.rows() as f32));
+        let mut pts_out = Vector::<Point2f>::new();
+        core::perspective_transform(&pts_in, &mut pts_out, &h_mat)?;
 
-        // Scale from 256-level to 2048-level image coordinates, then convert to Genshin game coordinates
-        let img_x = pos256.x * BIGMAP_256_SCALE_TO_2048;
-        let img_y = pos256.y * BIGMAP_256_SCALE_TO_2048;
-        let (gx, gy) = self.coord.image_to_game(img_x, img_y);
-        Ok((gx, gy, inliers))
+        let to_game = |p256: Point2f| -> (f32, f32) {
+            self.coord.image_to_game(
+                p256.x * BIGMAP_256_SCALE_TO_2048,
+                p256.y * BIGMAP_256_SCALE_TO_2048,
+            )
+        };
+        let (game_tl_x, game_tl_y) = to_game(pts_out.get(0)?);
+        let (game_center_x, game_center_y) = to_game(pts_out.get(1)?);
+        let (game_br_x, game_br_y) = to_game(pts_out.get(2)?);
+
+        Ok(BigMapRectMatch {
+            game_center_x,
+            game_center_y,
+            game_tl_x,
+            game_tl_y,
+            game_br_x,
+            game_br_y,
+            frame_width,
+            frame_height,
+            inliers,
+        })
     }
+
+    /// Locates big-map screenshot (grayscale or BGR) and returns `(game_x, game_y)` plus `inliers`.
+    pub fn locate_big_map(&mut self, frame_bgr_or_gray: &Mat) -> Result<(f32, f32, usize), CvError> {
+        let m = self.locate_big_map_rect(frame_bgr_or_gray)?;
+        Ok((m.game_center_x, m.game_center_y, m.inliers))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BigMapRectMatch {
+    pub game_center_x: f32,
+    pub game_center_y: f32,
+    pub game_tl_x: f32,
+    pub game_tl_y: f32,
+    pub game_br_x: f32,
+    pub game_br_y: f32,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub inliers: usize,
 }
 
 #[cfg(test)]
