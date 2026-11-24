@@ -1,0 +1,10 @@
+[package]
+name = "bgi-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bgi-control = { path = "../bgi-control" }
+egui.workspace = true
+tokio = { workspace = true, features = ["sync"] }

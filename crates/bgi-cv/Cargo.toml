@@ -1,0 +1,15 @@
+[package]
+name = "bgi-cv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+opencv411 = ["dep:opencv"]
+
+[dependencies]
+opencv = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "bgi-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["sync"] }

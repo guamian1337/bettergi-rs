@@ -1,0 +1,27 @@
+[package]
+name = "bgi-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bettergi"
+path = "src/main.rs"
+
+[dependencies]
+bgi-capture = { path = "../bgi-capture" }
+bgi-control = { path = "../bgi-control" }
+bgi-cv = { path = "../bgi-cv", features = ["opencv411"] }
+bgi-infer = { path = "../bgi-infer", features = ["paddle-ocr"] }
+bgi-input = { path = "../bgi-input" }
+bgi-pathing = { path = "../bgi-pathing" }
+bgi-ui = { path = "../bgi-ui" }
+egui.workspace = true
+egui-wgpu.workspace = true
+image.workspace = true
+mimalloc.workspace = true
+raw-window-handle.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+windows.workspace = true

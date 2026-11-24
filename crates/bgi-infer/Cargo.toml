@@ -1,0 +1,16 @@
+[package]
+name = "bgi-infer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+ort-dynamic = ["dep:ort"]
+paddle-ocr = ["ort-dynamic", "dep:bgi-cv", "dep:opencv"]
+
+[dependencies]
+bgi-cv = { path = "../bgi-cv", optional = true, features = ["opencv411"] }
+opencv = { workspace = true, optional = true }
+ort = { workspace = true, optional = true }
+thiserror.workspace = true

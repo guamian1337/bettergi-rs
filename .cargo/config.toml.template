@@ -1,0 +1,8 @@
+# Copy this file to `.cargo/config.toml` or run `scripts/setup_native_deps.ps1`
+# to configure OpenCV 4.11 + libclang for Phase 2 (`--features opencv411`).
+
+[env]
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+# OPENCV_INCLUDE_PATHS = "D:\\bgiprro\\bettergi-rs\\vendor\\opencv\\build\\include"
+# OPENCV_LINK_PATHS = "D:\\bgiprro\\bettergi-rs\\vendor\\opencv\\build\\x64\\vc16\\lib"
+# OPENCV_LINK_LIBS = "opencv_world4110"
