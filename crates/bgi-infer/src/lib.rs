@@ -1,5 +1,18 @@
 #[cfg(feature = "paddle-ocr")]
+pub mod item_icon;
+#[cfg(feature = "paddle-ocr")]
+pub use item_icon::{ArtifactIconMatch, ItemIconMatch, ItemIconPaths, ItemIconRecognizer};
+#[cfg(feature = "paddle-ocr")]
+pub mod mining;
+#[cfg(feature = "paddle-ocr")]
 pub mod paddle_ocr;
+#[cfg(feature = "paddle-ocr")]
+pub use mining::{MiningDetection, MiningDetector};
+
+#[cfg(feature = "paddle-ocr")]
+pub mod weapon_name;
+#[cfg(feature = "paddle-ocr")]
+pub use weapon_name::{WeaponNameCatalog, WeaponNameMatch, normalize_weapon_name};
 
 use std::time::Duration;
 
@@ -49,6 +62,11 @@ pub struct OcrResult {
 
 /// Phase 2 trait boundary for PaddleOCR with idle-unload support.
 pub trait OcrService: Send + Sync {
-    fn recognize_bgra(&mut self, bgra: &[u8], width: u32, height: u32) -> Result<OcrResult, InferError>;
+    fn recognize_bgra(
+        &mut self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<OcrResult, InferError>;
     fn unload_if_idle(&mut self);
 }

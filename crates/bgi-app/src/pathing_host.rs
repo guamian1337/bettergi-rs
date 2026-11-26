@@ -1,39 +1,71 @@
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bgi_capture::{CapturedFrame, CapturerBackend, FrameBufferPool};
-use bgi_control::{CaptureMode, LogLevel};
+use bgi_control::{CaptureMode, LogLevel, TaskReport};
 use bgi_pathing::{
-    BigMapObservation, BigMapProjection, MinimapObservation, OcrHit, PathingHost,
+    AutoPickFrame, BigMapLayerButtons, BigMapObservation, BigMapProjection, CookingObservation,
+    MinimapObservation, MotionStatus, OcrHit, PathingHost,
 };
+use bgi_task::{AUTO_PICK_MAX_OBSERVATION_AGE, PauseController, PauseLease};
 use tokio::sync::mpsc;
 
-use crate::core::CvOcrServices;
+use crate::capture_host::ActiveCapturer;
+use crate::cv_service::{ArtifactSalvageStep, CvOcrServices};
 
 pub(crate) enum PathingEvent {
     Progress {
+        task_id: u64,
         current_index: usize,
         total_points: usize,
     },
     Log {
+        task_id: u64,
         level: LogLevel,
         message: String,
     },
-    Finished(Result<String, String>),
+    Finished {
+        task_id: u64,
+        result: Result<TaskReport, String>,
+    },
+    SalvagePreviewFinished {
+        task_id: u64,
+        result: Result<TaskReport, String>,
+        preview: Option<bgi_control::SalvagePreviewReport>,
+    },
 }
 
 pub(crate) struct CorePathingHost {
+    pub task_id: u64,
     pub hwnd: isize,
     pub mode: CaptureMode,
     pub cancel: Arc<AtomicBool>,
-    pub capturer: Arc<Mutex<Option<(isize, CaptureMode, CapturerBackend)>>>,
+    pub capturer: Arc<Mutex<ActiveCapturer>>,
     pub pool: Arc<FrameBufferPool>,
     pub cv_ocr: Arc<Mutex<CvOcrServices>>,
     pub events_tx: mpsc::UnboundedSender<PathingEvent>,
+    pub current_index: Option<usize>,
+    pub pauses: PauseController,
+    pub(crate) input_pause: Option<PauseLease>,
+    pub(crate) held_keys: BTreeSet<u16>,
+    pub(crate) right_mouse_held: bool,
 }
 
 impl CorePathingHost {
+    fn acquire_input_pause(&mut self) {
+        if self.input_pause.is_none() {
+            self.input_pause = Some(self.pauses.pause().expect("pause owner overflow"));
+        }
+    }
+
+    fn release_input_pause_if_idle(&mut self) {
+        if self.held_keys.is_empty() && !self.right_mouse_held {
+            self.input_pause = None;
+        }
+    }
+
     fn capture_raw_frame(&self) -> Result<Option<CapturedFrame>, String> {
         let mut guard = self.capturer.lock().unwrap();
         let need_reopen = match &*guard {
@@ -56,11 +88,154 @@ impl CorePathingHost {
             }
         }
     }
+
+    pub(crate) fn click_client_guarded(&mut self, x: i32, y: i32) -> bool {
+        let _pause = self.pauses.pause().expect("pause owner overflow");
+        bgi_input::mouse_left_click_client_checked(self.hwnd, x, y)
+    }
+
+    pub(crate) fn detect_artifact_salvage(&self) -> Result<Option<ArtifactSalvageStep>, String> {
+        let Some(frame) = self.capture_raw_frame()? else {
+            return Ok(None);
+        };
+        let mut guard = self.cv_ocr.lock().unwrap();
+        guard
+            .detect_artifact_salvage_step(
+                frame.data.as_slice(),
+                frame.width,
+                frame.height,
+                frame.format.is_bgr24(),
+            )
+            .map(Some)
+    }
+
+    /// The salvage preview bridge can only emit wheel input. It has no click/key action.
+    pub(crate) fn scroll_artifact_salvage_preview(
+        &mut self,
+        center: (i32, i32),
+        notches: i32,
+        frame_size: (u32, u32),
+    ) -> Result<(), String> {
+        if self.is_cancelled() {
+            return Err("分解预览已取消".into());
+        }
+        if !bgi_input::is_foreground_window(self.hwnd) {
+            return Err("游戏窗口不在前台，已停止分解预览".into());
+        }
+        if !(-3..=-1).contains(&notches)
+            || center.0 < 0
+            || center.1 < 0
+            || center.0 >= frame_size.0 as i32
+            || center.1 >= frame_size.1 as i32
+        {
+            return Err("分解预览滚动参数越界，已停止".into());
+        }
+        let _pause = self.pauses.pause().expect("pause owner overflow");
+        let direction = if notches > 0 { 1 } else { -1 };
+        for _ in 0..notches.abs() {
+            if self.is_cancelled() {
+                return Err("分解预览已取消".into());
+            }
+            bgi_input::mouse_wheel_notch_checked(
+                self.hwnd, center.0, center.1, frame_size, direction,
+            )
+            .map_err(str::to_string)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn detect_auto_wood(
+        &self,
+    ) -> Result<Option<(bgi_cv::auto_wood_templates::AutoWoodObservation, bool)>, String> {
+        let Some(frame) = self.capture_raw_frame()? else {
+            return Ok(None);
+        };
+        let mut guard = self.cv_ocr.lock().unwrap();
+        guard
+            .detect_auto_wood_step(
+                frame.data.as_slice(),
+                frame.width,
+                frame.height,
+                frame.format.is_bgr24(),
+            )
+            .map(Some)
+    }
+
+    pub(crate) fn detect_expedition(
+        &self,
+    ) -> Result<Option<bgi_cv::expedition::ExpeditionObservation>, String> {
+        let Some(frame) = self.capture_raw_frame()? else {
+            return Ok(None);
+        };
+        let mut guard = self.cv_ocr.lock().unwrap();
+        guard
+            .detect_expedition_observation(
+                frame.data.as_slice(),
+                frame.width,
+                frame.height,
+                frame.format.is_bgr24(),
+            )
+            .map(Some)
+    }
+
+    pub(crate) fn detect_chest(
+        &self,
+    ) -> Result<Option<(bgi_cv::chest_templates::ChestObservation, bool)>, String> {
+        let Some(frame) = self.capture_raw_frame()? else {
+            return Ok(None);
+        };
+        let mut guard = self.cv_ocr.lock().unwrap();
+        guard
+            .detect_chest_step(
+                frame.data.as_slice(),
+                frame.width,
+                frame.height,
+                frame.format.is_bgr24(),
+            )
+            .map(Some)
+    }
+
+    pub(crate) fn detect_rewards(
+        &self,
+    ) -> Result<Option<(Vec<bgi_task::RewardCandidate>, bool)>, String> {
+        let Some(frame) = self.capture_raw_frame()? else {
+            return Ok(None);
+        };
+        let mut guard = self.cv_ocr.lock().unwrap();
+        guard
+            .detect_rewards_step(
+                frame.data.as_slice(),
+                frame.width,
+                frame.height,
+                frame.format.is_bgr24(),
+            )
+            .map(Some)
+    }
 }
 
 impl PathingHost for CorePathingHost {
     fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Acquire)
+    }
+
+    fn current_waypoint_index(&self) -> Option<usize> {
+        self.current_index
+    }
+
+    fn detect_loading(&mut self) -> Result<bool, String> {
+        let Some(frame) = self.capture_raw_frame()? else {
+            return Ok(true);
+        };
+        let mut guard = self.cv_ocr.lock().unwrap();
+        Ok(guard
+            .locate_minimap_step(
+                frame.data.as_slice(),
+                frame.width,
+                frame.height,
+                frame.format.is_bgr24(),
+                None,
+            )?
+            .is_none())
     }
 
     fn dpi_scale(&self) -> f32 {
@@ -101,7 +276,12 @@ impl PathingHost for CorePathingHost {
                 frame.height,
                 frame.format.is_bgr24(),
             )
-            .map(|opt| opt.map(|(proj, inliers)| BigMapObservation { projection: proj, inliers }))
+            .map(|opt| {
+                opt.map(|(proj, inliers)| BigMapObservation {
+                    projection: proj,
+                    inliers,
+                })
+            })
     }
 
     fn capture_ocr_roi(
@@ -127,8 +307,53 @@ impl PathingHost for CorePathingHost {
         )
     }
 
+    fn capture_auto_pick(&mut self) -> Result<Option<AutoPickFrame>, String> {
+        let observed_at = std::time::Instant::now();
+        let Some(frame) = self.capture_raw_frame()? else {
+            return Ok(None);
+        };
+        let mut guard = self.cv_ocr.lock().unwrap();
+        let (observation, ocr_hits) = guard.detect_auto_pick_step(
+            frame.data.as_slice(),
+            frame.width,
+            frame.height,
+            frame.format.is_bgr24(),
+        )?;
+        Ok(Some(AutoPickFrame {
+            width: observation.width,
+            height: observation.height,
+            prompt: observation.prompt,
+            ocr_hits,
+            observed_at,
+        }))
+    }
+
+    fn key_tap_checked(
+        &mut self,
+        vk: u16,
+        hold_ms: u64,
+        frame_size: (u32, u32),
+        observed_at: Instant,
+    ) -> Result<(), String> {
+        if self.is_cancelled() {
+            return Err("自动拾取已取消".into());
+        }
+        let Some(_pause) = self.pauses.try_pause().map_err(|e| e.to_string())? else {
+            return Err("自动拾取已暂停".into());
+        };
+        bgi_input::key_tap_checked_if(self.hwnd, vk, hold_ms, frame_size, || {
+            !self.is_cancelled()
+                && observed_at.elapsed() <= AUTO_PICK_MAX_OBSERVATION_AGE
+                && _pause.is_active()
+        })
+        .map_err(str::to_string)
+    }
+
     fn set_minimap_prev_pos(&mut self, x: f32, y: f32) {
-        self.cv_ocr.lock().unwrap().set_last_minimap_pos(Some((x, y)));
+        self.cv_ocr
+            .lock()
+            .unwrap()
+            .set_last_minimap_pos(Some((x, y)));
     }
 
     fn reset_minimap_prev_pos(&mut self) {
@@ -146,14 +371,19 @@ impl PathingHost for CorePathingHost {
     }
 
     fn key_down(&mut self, vk: u16) {
+        self.acquire_input_pause();
+        self.held_keys.insert(vk);
         bgi_input::key_down(vk);
     }
 
     fn key_up(&mut self, vk: u16) {
         bgi_input::key_up(vk);
+        self.held_keys.remove(&vk);
+        self.release_input_pause_if_idle();
     }
 
     fn key_tap(&mut self, vk: u16, hold_ms: u64) {
+        let _pause = self.pauses.pause().expect("pause owner overflow");
         bgi_input::key_tap(vk, hold_ms);
     }
 
@@ -161,35 +391,143 @@ impl PathingHost for CorePathingHost {
         bgi_input::mouse_move_rel(dx, dy);
     }
 
+    fn mouse_move_client(&mut self, x: i32, y: i32) {
+        bgi_input::mouse_move_to_client(self.hwnd, x, y);
+    }
+
     fn mouse_left_click(&mut self) {
+        let _pause = self.pauses.pause().expect("pause owner overflow");
         bgi_input::mouse_left_click();
     }
 
+    fn mouse_right_click(&mut self) {
+        let _pause = self.pauses.pause().expect("pause owner overflow");
+        bgi_input::mouse_right_click();
+    }
+
+    fn mouse_right_down(&mut self) {
+        self.acquire_input_pause();
+        self.right_mouse_held = true;
+        bgi_input::mouse_right_down();
+    }
+
+    fn mouse_right_up(&mut self) {
+        bgi_input::mouse_right_up();
+        self.right_mouse_held = false;
+        self.release_input_pause_if_idle();
+    }
+
     fn mouse_left_click_client(&mut self, x: i32, y: i32) {
+        let _pause = self.pauses.pause().expect("pause owner overflow");
         bgi_input::mouse_left_click_client(self.hwnd, x, y);
     }
 
     fn mouse_drag_client(&mut self, x1: i32, y1: i32, x2: i32, y2: i32) {
+        let _pause = self.pauses.pause().expect("pause owner overflow");
         bgi_input::mouse_drag_client(self.hwnd, x1, y1, x2, y2);
     }
 
     fn mouse_wheel(&mut self, notches: i32) {
+        let _pause = self.pauses.pause().expect("pause owner overflow");
         bgi_input::mouse_wheel(notches);
+    }
+
+    fn detect_bigmap_layer_buttons(&mut self) -> Result<BigMapLayerButtons, String> {
+        let Some(frame) = self.capture_raw_frame()? else {
+            return Ok(BigMapLayerButtons::default());
+        };
+        let mut guard = self.cv_ocr.lock().unwrap();
+        guard.detect_bigmap_layer_buttons_step(
+            frame.data.as_slice(),
+            frame.width,
+            frame.height,
+            frame.format.is_bgr24(),
+        )
+    }
+
+    fn detect_motion_status(&mut self) -> Result<MotionStatus, String> {
+        let Some(frame) = self.capture_raw_frame()? else {
+            return Err("当前帧尚未就绪，无法判断运动状态".to_string());
+        };
+        let mut guard = self.cv_ocr.lock().unwrap();
+        guard.detect_motion_status_step(
+            frame.data.as_slice(),
+            frame.width,
+            frame.height,
+            frame.format.is_bgr24(),
+        )
+    }
+    fn capture_cooking_bar(&mut self) -> Result<Option<CookingObservation>, String> {
+        let Some(frame) = self.capture_raw_frame()? else {
+            return Ok(None);
+        };
+        let mut guard = self.cv_ocr.lock().unwrap();
+        let ui = guard.detect_cooking_ui_step(
+            frame.data.as_slice(),
+            frame.width,
+            frame.height,
+            frame.format.is_bgr24(),
+        )?;
+        let (page_visible, white_confirm, recover_visible) =
+            (ui.page_visible, ui.white_confirm, ui.recover_visible);
+        let scale = f64::from(frame.height) / 1080.0;
+        let left = (600.0 * scale).round().max(0.0) as u32;
+        let top = (660.0 * scale).round().max(0.0) as u32;
+        let width = (730.0 * scale).round().max(0.0) as u32;
+        let height = (190.0 * scale).round().max(0.0) as u32;
+        if left >= frame.width || top >= frame.height {
+            return Ok(Some(CookingObservation {
+                color_count: 0,
+                scale,
+                page_visible,
+                white_confirm,
+                recover_visible,
+            }));
+        }
+        let right = left.saturating_add(width).min(frame.width);
+        let bottom = top.saturating_add(height).min(frame.height);
+        let channels = if frame.format.is_bgr24() { 3 } else { 4 };
+        let mut count = 0u32;
+        for y in top..bottom {
+            let start = (y * frame.width + left) as usize * channels;
+            let end = (y * frame.width + right) as usize * channels;
+            for pixel in frame.data.as_slice()[start..end].chunks_exact(channels) {
+                if pixel[0] == 64 && pixel[1] == 192 && pixel[2] == 255 {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        Ok(Some(CookingObservation {
+            color_count: count,
+            scale,
+            page_visible,
+            white_confirm,
+            recover_visible,
+        }))
     }
 
     fn release_all_keys(&mut self) {
         bgi_input::release_all_keys();
+        self.held_keys.clear();
+        self.right_mouse_held = false;
+        self.input_pause = None;
     }
 
     fn on_progress(&mut self, current_index: usize, total_points: usize) {
+        self.current_index = Some(current_index);
         let _ = self.events_tx.send(PathingEvent::Progress {
+            task_id: self.task_id,
             current_index,
             total_points,
         });
     }
 
     fn on_log(&mut self, level: LogLevel, message: String) {
-        let _ = self.events_tx.send(PathingEvent::Log { level, message });
+        let _ = self.events_tx.send(PathingEvent::Log {
+            task_id: self.task_id,
+            level,
+            message,
+        });
     }
 }
 

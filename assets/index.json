@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "default_locale": "zh-CN",
+  "locales": {
+    "zh-CN": {
+      "templates": {
+        "ui.chest": "Templates/chest.png",
+        "ui.chest_f_icon": "Templates/chest_F_icon.png",
+        "ui.paimon_menu": "Templates/paimon_menu.png",
+        "ui.inventory": "Templates/inventory.png",
+        "ui.in_domain": "Templates/in_domain.png",
+        "ui.cook_icon": "Templates/ui_left_top_cook_icon.png",
+        "ui.white_confirm": "Templates/btn_white_confirm.png",
+        "ui.talk": "Templates/disabled_ui.png",
+        "ui.recovery": "Templates/Recovery.png",
+        "ui.resurrection": "Templates/Resurrection.png",
+        "ui.claim_text": "Templates/claim_text.png",
+        "ui.claim_gift": "Templates/claim_gift.png",
+        "ui.click_blank_continue": "Templates/click_blank_continue.png",
+        "ui.auto_wood.gadget": "Templates/TheBoonOfTheElderTree.png",
+        "ui.auto_wood.menu": "Templates/menu_bag.png",
+        "ui.auto_wood.confirm": "Templates/confirm.png",
+        "ui.auto_wood.enter_game": "Templates/exit_welcome.png",
+        "ui.artifact_salvage.inventory": "Templates/btn_artifact_salvage.png",
+        "ui.artifact_salvage.confirm": "Templates/btn_artifact_salvage_confirm.png",
+        "ui.artifact_salvage.black_confirm": "Templates/btn_black_confirm.png",
+        "ui.auto_pick.pick": "Templates/auto_pick_F.png",
+        "ui.auto_pick.l": "Templates/auto_pick_L.png",
+        "ui.auto_pick.settings": "Templates/auto_pick_settings.png",
+        "ui.auto_pick.chat": "Templates/auto_pick_chat.png"
+      },
+      "ocr": {
+        "det": "Model/PaddleOCR/Det/V5/PP-OCRv5_mobile_det_infer/slim.onnx",
+        "rec": "Model/PaddleOCR/Rec/V5/PP-OCRv5_mobile_rec_infer/slim.onnx",
+        "dict": "Model/PaddleOCR/Rec/V5/PP-OCRv5_mobile_rec_infer/inference.yml"
+      },
+      "models": {
+        "mine": "Model/Mine/bgi_mine.onnx"
+      },
+      "text": {
+        "start": ["开始", "启动"],
+        "stop": ["停止"],
+        "confirm": ["确认"]
+      },
+      "maps": {
+        "Teyvat": "Map/Teyvat"
+      }
+    }
+  },
+  "layouts": {
+    "default": {
+      "base_width": 1920,
+      "base_height": 1080,
+      "rois": {
+        "minimap": { "x": 0.0322916667, "y": 0.0175925926, "width": 0.1104166667, "height": 0.1962962963 },
+        "key_tip": { "x": 0.8177083333, "y": 0.9351851852, "width": 0.1041666667, "height": 0.0648148148 }
+      }
+    }
+  }
+}

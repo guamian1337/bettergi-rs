@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,28 @@ impl CaptureMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskOutcome {
+    Success,
+    Partial,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskReport {
+    pub task_id: u64,
+    pub task_name: String,
+    pub outcome: TaskOutcome,
+    pub runs_completed: u32,
+    pub runs_requested: u32,
+    pub current_index: Option<usize>,
+    pub total_points: usize,
+    pub failure: Option<String>,
+    pub stage: String,
+    pub elapsed_ms: u64,
+}
+
 /// Logical task state tracked by core and rendered in UI snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TaskState {
@@ -31,11 +54,63 @@ pub enum TaskState {
     Idle,
     Previewing,
     Pathing {
+        task_id: u64,
+        task_name: String,
+        current_index: usize,
+        total_points: usize,
+    },
+    Cooking {
+        task_id: u64,
+        task_name: String,
+    },
+    ClaimingRewards {
+        task_id: u64,
+        task_name: String,
+    },
+    OpeningChest {
+        task_id: u64,
+        task_name: String,
+    },
+    AutoWood {
+        task_id: u64,
+        task_name: String,
+    },
+    OneKeyExpedition {
+        task_id: u64,
+        task_name: String,
+    },
+    SalvagePreview {
+        task_id: u64,
+        task_name: String,
+    },
+    Fishing {
+        task_id: u64,
+        task_name: String,
+    },
+    Stopping {
+        task_id: u64,
         task_name: String,
         current_index: usize,
         total_points: usize,
     },
     Error(String),
+}
+
+impl TaskState {
+    pub fn is_task_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Pathing { .. }
+                | Self::Cooking { .. }
+                | Self::ClaimingRewards { .. }
+                | Self::OpeningChest { .. }
+                | Self::AutoWood { .. }
+                | Self::OneKeyExpedition { .. }
+                | Self::SalvagePreview { .. }
+                | Self::Fishing { .. }
+                | Self::Stopping { .. }
+        )
+    }
 }
 
 /// Supported global hotkey actions.
@@ -175,6 +250,107 @@ pub struct PathSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskLimitsConfig {
+    pub reward_claim_max_clicks: usize,
+    pub reward_claim_timeout_ms: u64,
+    pub auto_open_chest_timeout_ms: u64,
+    pub auto_open_chest_target_lost_timeout_ms: u64,
+    pub auto_open_chest_verify_timeout_ms: u64,
+    pub auto_wood_total_timeout_ms: u64,
+    pub auto_wood_gain_timeout_ms: u64,
+    pub auto_wood_login_timeout_ms: u64,
+    pub auto_wood_menu_timeout_ms: u64,
+    pub auto_wood_logout_confirm_timeout_ms: u64,
+    pub auto_wood_empty_ocr_limit: u8,
+    #[serde(default = "default_fishing_timeout")]
+    pub fishing_total_timeout_ms: u64,
+}
+
+impl Default for TaskLimitsConfig {
+    fn default() -> Self {
+        Self {
+            reward_claim_max_clicks: 30,
+            reward_claim_timeout_ms: 30_000,
+            auto_open_chest_timeout_ms: 60_000,
+            auto_open_chest_target_lost_timeout_ms: 1500,
+            auto_open_chest_verify_timeout_ms: 2000,
+            auto_wood_total_timeout_ms: 120_000,
+            auto_wood_gain_timeout_ms: 30_000,
+            auto_wood_login_timeout_ms: 90_000,
+            auto_wood_menu_timeout_ms: 10_000,
+            auto_wood_logout_confirm_timeout_ms: 15_000,
+            auto_wood_empty_ocr_limit: 3,
+            fishing_total_timeout_ms: default_fishing_timeout(),
+        }
+    }
+}
+
+impl TaskLimitsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=100).contains(&self.reward_claim_max_clicks) {
+            return Err("单页领取点击上限必须在 1..=100".into());
+        }
+        for (name, value, min, max) in [
+            ("领取总超时", self.reward_claim_timeout_ms, 1000, 600_000),
+            (
+                "开箱总超时",
+                self.auto_open_chest_timeout_ms,
+                1000,
+                3_600_000,
+            ),
+            (
+                "开箱目标丢失超时",
+                self.auto_open_chest_target_lost_timeout_ms,
+                500,
+                10_000,
+            ),
+            (
+                "开箱验证超时",
+                self.auto_open_chest_verify_timeout_ms,
+                500,
+                30_000,
+            ),
+            (
+                "砍树总超时",
+                self.auto_wood_total_timeout_ms,
+                1000,
+                3_600_000,
+            ),
+            (
+                "砍树收益超时",
+                self.auto_wood_gain_timeout_ms,
+                1000,
+                600_000,
+            ),
+            (
+                "砍树登录超时",
+                self.auto_wood_login_timeout_ms,
+                1000,
+                600_000,
+            ),
+            ("砍树菜单超时", self.auto_wood_menu_timeout_ms, 1000, 60_000),
+            (
+                "砍树退出确认超时",
+                self.auto_wood_logout_confirm_timeout_ms,
+                1000,
+                60_000,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                return Err(format!("{name}必须在 {min}..={max} ms"));
+            }
+        }
+        if !(1..=10).contains(&self.auto_wood_empty_ocr_limit) {
+            return Err("砍树空 OCR 上限必须在 1..=10".into());
+        }
+        if !(1000..=3_600_000).contains(&self.fishing_total_timeout_ms) {
+            return Err("钓鱼总超时必须在 1000..=3600000 ms".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreConfig {
     pub capture_mode: CaptureMode,
     pub preferred_process: String,
@@ -183,7 +359,53 @@ pub struct CoreConfig {
     pub capture_only_no_render: bool,
     pub pathing_dir: String,
     pub assets_dir: String,
+    #[serde(default = "default_pathing_runs")]
+    pub pathing_runs: u32,
+    #[serde(default = "default_pathing_loop_delay")]
+    pub pathing_loop_delay_ms: u64,
+    #[serde(default)]
+    pub pathing_wait_for_loading: bool,
+    #[serde(default)]
+    pub pathing_auto_pick: bool,
+    #[serde(default)]
+    pub auto_skip: bool,
+    #[serde(default)]
+    pub auto_eat: bool,
+    #[serde(default = "default_auto_cook_interval")]
+    pub auto_cook_interval_ms: u64,
+    #[serde(default = "default_true")]
+    pub auto_cook_stop_on_recover: bool,
+    #[serde(default = "default_auto_cook_timeout")]
+    pub auto_cook_timeout_ms: u64,
+    #[serde(default)]
+    pub task_limits: TaskLimitsConfig,
+    #[serde(default = "default_true")]
+    pub fishing_dry_run: bool,
     pub hotkeys: Vec<HotkeyBinding>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_fishing_timeout() -> u64 {
+    120_000
+}
+
+fn default_pathing_runs() -> u32 {
+    1
+}
+
+fn default_pathing_loop_delay() -> u64 {
+    1000
+}
+
+fn default_auto_cook_interval() -> u64 {
+    10
+}
+
+fn default_auto_cook_timeout() -> u64 {
+    120_000
 }
 
 impl Default for CoreConfig {
@@ -195,6 +417,17 @@ impl Default for CoreConfig {
             capture_only_no_render: false,
             pathing_dir: String::new(),
             assets_dir: String::new(),
+            pathing_runs: 1,
+            pathing_loop_delay_ms: 1000,
+            pathing_wait_for_loading: false,
+            pathing_auto_pick: false,
+            auto_skip: false,
+            auto_eat: false,
+            auto_cook_interval_ms: default_auto_cook_interval(),
+            auto_cook_stop_on_recover: true,
+            auto_cook_timeout_ms: default_auto_cook_timeout(),
+            task_limits: TaskLimitsConfig::default(),
+            fishing_dry_run: true,
             hotkeys: vec![
                 HotkeyBinding {
                     action: HotkeyAction::StartStopPathing,
@@ -249,6 +482,93 @@ pub struct CaptureStats {
     pub measured_fps: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct StageMetricsSnapshot {
+    pub samples: u64,
+    pub total_ms: f32,
+    pub max_ms: f32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeMetricsSnapshot {
+    pub submitted: u64,
+    pub completed: u64,
+    pub dropped: u64,
+    pub deadline_hits: u64,
+    pub deadline_misses: u64,
+    pub deadline_hit_rate: f32,
+    pub average_queue_delay_us: u64,
+    pub max_queue_delay_us: u64,
+    pub capture: StageMetricsSnapshot,
+    pub recognition: StageMetricsSnapshot,
+    pub decision: StageMetricsSnapshot,
+    pub input: StageMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SalvagePreviewPosition {
+    pub page: u8,
+    pub slot: usize,
+    pub row: u8,
+    pub column: u8,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SalvagePreviewCandidate {
+    /// Observation ID scoped to one preview session, not a persistent game item ID.
+    pub id: u64,
+    pub position: SalvagePreviewPosition,
+    pub star: u8,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SalvagePreviewSkipStats {
+    pub empty: usize,
+    pub locked: usize,
+    pub selected: usize,
+    pub five_star: usize,
+    pub overlapping: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SalvagePreviewStopReason {
+    Complete,
+    EmptyPage,
+    PageLimit,
+    NoProgress,
+    InteractionBudget,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SalvagePreviewReport {
+    pub candidates: Vec<SalvagePreviewCandidate>,
+    pub skipped: SalvagePreviewSkipStats,
+    pub pages_seen: u8,
+    pub interactions_used: u16,
+    pub no_progress: u8,
+    pub selection_clicks: u16,
+    pub salvage_clicks: u16,
+    pub confirmation_clicks: u16,
+    pub stop_reason: Option<SalvagePreviewStopReason>,
+    pub failure: Option<String>,
+    /// Always false. A preview report never authorizes destructive confirmation.
+    pub final_confirmation_authorized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerLeaseStatus {
+    pub id: u64,
+    pub name: String,
+    pub options: serde_json::Value,
+}
+
 /// Read-only state snapshot published by `bgi-core` via `watch`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct UiSnapshot {
@@ -264,8 +584,18 @@ pub struct UiSnapshot {
     pub config: CoreConfig,
     pub preview_enabled: bool,
     #[serde(default)]
+    pub triggers_active: bool,
+    #[serde(default)]
+    pub trigger_leases: Vec<TriggerLeaseStatus>,
+    #[serde(default)]
     pub capture_stats: CaptureStats,
+    #[serde(default)]
+    pub runtime_metrics: RuntimeMetricsSnapshot,
     pub cv_debug: CvDebugResult,
+    #[serde(default)]
+    pub last_task_report: Option<TaskReport>,
+    #[serde(default)]
+    pub last_salvage_preview_report: Option<SalvagePreviewReport>,
 }
 
 /// Separate image data plane (`ArcSwap` single-slot, newest frame wins).
@@ -297,12 +627,23 @@ impl LogLevel {
             Self::Error => "ERR",
         }
     }
+
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Debug => 0,
+            Self::Info => 1,
+            Self::Warn => 2,
+            Self::Error => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub seq: u64,
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub timestamp: String,
     pub level: LogLevel,
     pub target: String,
     pub message: String,
@@ -335,18 +676,48 @@ pub enum CoreCommand {
     SetCaptureNoRender(bool),
     SetPreviewFps(u32),
     CaptureSingleFrame,
+    StartFrameRecording(String),
+    StopFrameRecording,
+    StartFrameReplay(String),
+    StopFrameReplay,
     SetPathingDir(String),
+    SetPathingRuns(u32),
+    SetPathingLoopDelayMs(u64),
+    SetPathingWaitForLoading(bool),
+    SetPathingAutoPick(bool),
+    SetAutoSkipEnabled(bool),
+    SetAutoEatEnabled(bool),
+    SetAutoCookIntervalMs(u64),
+    SetAutoCookStopOnRecover(bool),
+    SetAutoCookTimeoutMs(u64),
+    SetTaskLimits(TaskLimitsConfig),
     SetAssetsDir(String),
     RefreshPaths,
     SelectPath { file_path: String },
     ProbeMiniMapCv,
     ProbeBigMapSift,
     ProbeOcrScreen,
+    ProbeWeaponDetails,
+    ProbeTalentDetails,
+    ProbeCharacterAttributes,
+    ProbeRewardResultCards,
+    ProbeExpeditionStatus,
+    ProbeMining,
     BeginHotkeyCapture(Option<HotkeyAction>),
     UpdateHotkey(HotkeyBinding),
     TestInputKey { vk: u16 },
     StartBasicPathing,
+    StartAutoCook,
+    ClaimCurrentPageRewards,
+    ClaimVisiblePageRewards,
+    OpenCurrentChest,
+    StartAutoWood { verify_gain: bool },
+    StartOneKeyExpedition,
+    StartArtifactSalvagePreview,
+    StartFishing { dry_run: bool },
+    SetFishingDryRun(bool),
     StopPathing,
+    OpenLogDir,
     EmergencyStop,
     ShutdownCore,
 }
@@ -356,8 +727,72 @@ pub struct CommandEnvelope {
     pub reply: oneshot::Sender<Result<(), String>>,
 }
 
+pub const MAX_LOG_HISTORY: usize = 1000;
+
 pub type SharedPreview = Arc<ArcSwap<Option<Arc<FramePreview>>>>;
 pub type UiWakeCallback = Arc<dyn Fn() + Send + Sync>;
+pub type TimestampProvider = Arc<dyn Fn() -> String + Send + Sync>;
+pub type LogMirrorCallback = Arc<dyn Fn(&LogEntry) + Send + Sync>;
+
+/// Shared log sink bridging `CoreEndpoint::emit_log`, `tracing` layers, disk persistence, and UI.
+#[derive(Clone)]
+pub struct LogPublisher {
+    event_tx: mpsc::Sender<CoreEvent>,
+    waker_slot: UiWakerSlot,
+    log_seq: Arc<AtomicU64>,
+    start_instant: std::time::Instant,
+    history: Arc<Mutex<VecDeque<LogEntry>>>,
+    timestamp_fn: Arc<ArcSwap<Option<TimestampProvider>>>,
+    mirror_slot: Arc<ArcSwap<Option<LogMirrorCallback>>>,
+}
+
+impl LogPublisher {
+    /// Installs an optional wall-clock timestamp formatter (e.g. `HH:MM:SS.mmm`).
+    pub fn set_timestamp_provider(&self, provider: Option<TimestampProvider>) {
+        self.timestamp_fn.store(Arc::new(provider));
+    }
+
+    /// Installs an optional synchronous sink (such as rolling file + stderr mirror).
+    /// Implementations must NOT call `tracing::*!` inside this callback.
+    pub fn set_mirror(&self, mirror: Option<LogMirrorCallback>) {
+        self.mirror_slot.store(Arc::new(mirror));
+    }
+
+    pub fn emit(&self, level: LogLevel, target: impl Into<String>, message: impl Into<String>) {
+        let seq = self.log_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
+        let timestamp = self
+            .timestamp_fn
+            .load()
+            .as_ref()
+            .as_ref()
+            .map(|cb| cb())
+            .unwrap_or_else(|| format!("{:>7}ms", elapsed_ms));
+        let entry = LogEntry {
+            seq,
+            elapsed_ms,
+            timestamp,
+            level,
+            target: target.into(),
+            message: message.into(),
+        };
+
+        {
+            let mut guard = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.len() >= MAX_LOG_HISTORY {
+                guard.pop_front();
+            }
+            guard.push_back(entry.clone());
+        }
+
+        if let Some(mirror) = self.mirror_slot.load().as_ref() {
+            mirror(&entry);
+        }
+
+        let _ = self.event_tx.try_send(CoreEvent::Log(entry));
+        self.waker_slot.wake();
+    }
+}
 
 /// Thread-safe UI repaint hook registered only while an `egui` window is open.
 #[derive(Clone, Default)]
@@ -383,14 +818,21 @@ pub struct ControlClient {
     event_rx: mpsc::Receiver<CoreEvent>,
     preview_slot: SharedPreview,
     waker_slot: UiWakerSlot,
+    log_history: Arc<Mutex<VecDeque<LogEntry>>>,
 }
 
 impl ControlClient {
     /// Non-blocking command dispatch so UI thread never stalls.
-    pub fn send_cmd(&self, cmd: CoreCommand) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+    pub fn send_cmd(
+        &self,
+        cmd: CoreCommand,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .try_send(CommandEnvelope { cmd, reply: reply_tx })
+            .try_send(CommandEnvelope {
+                cmd,
+                reply: reply_tx,
+            })
             .map_err(|err| format!("控制通道拥塞或已关闭: {err}"))?;
         Ok(reply_rx)
     }
@@ -406,6 +848,15 @@ impl ControlClient {
 
     pub fn try_recv_event(&mut self) -> Option<CoreEvent> {
         self.event_rx.try_recv().ok()
+    }
+
+    pub fn recent_logs(&self) -> Vec<LogEntry> {
+        self.log_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn latest_preview(&self) -> Option<Arc<FramePreview>> {
@@ -424,10 +875,16 @@ pub struct CommandDispatcher {
 }
 
 impl CommandDispatcher {
-    pub fn try_send(&self, cmd: CoreCommand) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+    pub fn try_send(
+        &self,
+        cmd: CoreCommand,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .try_send(CommandEnvelope { cmd, reply: reply_tx })
+            .try_send(CommandEnvelope {
+                cmd,
+                reply: reply_tx,
+            })
             .map_err(|err| format!("控制通道拥塞或已关闭: {err}"))?;
         Ok(reply_rx)
     }
@@ -439,8 +896,7 @@ pub struct CoreEndpoint {
     event_tx: mpsc::Sender<CoreEvent>,
     preview_slot: SharedPreview,
     waker_slot: UiWakerSlot,
-    log_seq: AtomicU64,
-    start_instant: std::time::Instant,
+    log_publisher: LogPublisher,
 }
 
 impl CoreEndpoint {
@@ -459,6 +915,10 @@ impl CoreEndpoint {
         self.waker_slot.wake();
     }
 
+    pub fn log_publisher(&self) -> LogPublisher {
+        self.log_publisher.clone()
+    }
+
     /// Bounded non-blocking event emission (`try_send` never back-pressures core tasks).
     pub fn emit_event(&self, event: CoreEvent) {
         let _ = self.event_tx.try_send(event);
@@ -466,24 +926,28 @@ impl CoreEndpoint {
     }
 
     pub fn emit_log(&self, level: LogLevel, target: impl Into<String>, message: impl Into<String>) {
-        let seq = self.log_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
-        self.emit_event(CoreEvent::Log(LogEntry {
-            seq,
-            elapsed_ms,
-            level,
-            target: target.into(),
-            message: message.into(),
-        }));
+        self.log_publisher.emit(level, target, message);
     }
 }
 
-pub fn create_control_bus(initial_snapshot: UiSnapshot) -> (ControlClient, CommandDispatcher, CoreEndpoint) {
+pub fn create_control_bus(
+    initial_snapshot: UiSnapshot,
+) -> (ControlClient, CommandDispatcher, CoreEndpoint) {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(initial_snapshot));
     let (event_tx, event_rx) = mpsc::channel(512);
     let preview_slot: SharedPreview = Arc::new(ArcSwap::from_pointee(None));
     let waker_slot = UiWakerSlot::default();
+    let log_history = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_HISTORY)));
+    let log_publisher = LogPublisher {
+        event_tx: event_tx.clone(),
+        waker_slot: waker_slot.clone(),
+        log_seq: Arc::new(AtomicU64::new(0)),
+        start_instant: std::time::Instant::now(),
+        history: log_history.clone(),
+        timestamp_fn: Arc::new(ArcSwap::from_pointee(None)),
+        mirror_slot: Arc::new(ArcSwap::from_pointee(None)),
+    };
 
     let dispatcher = CommandDispatcher {
         cmd_tx: cmd_tx.clone(),
@@ -494,6 +958,7 @@ pub fn create_control_bus(initial_snapshot: UiSnapshot) -> (ControlClient, Comma
         event_rx,
         preview_slot: preview_slot.clone(),
         waker_slot: waker_slot.clone(),
+        log_history,
     };
     let core = CoreEndpoint {
         cmd_rx,
@@ -501,8 +966,7 @@ pub fn create_control_bus(initial_snapshot: UiSnapshot) -> (ControlClient, Comma
         event_tx,
         preview_slot,
         waker_slot,
-        log_seq: AtomicU64::new(0),
-        start_instant: std::time::Instant::now(),
+        log_publisher,
     };
 
     (client, dispatcher, core)
@@ -527,8 +991,193 @@ mod tests {
         }
         assert_eq!(received, 512);
 
+        // History retains all 600 entries even after channel overflow, and caps at MAX_LOG_HISTORY.
+        let recent = client.recent_logs();
+        assert_eq!(recent.len(), 600);
+        assert_eq!(recent.last().map(|e| e.seq), Some(600));
+
+        for i in 600..1200 {
+            core.emit_log(LogLevel::Debug, "test", format!("msg {i}"));
+        }
+        let capped = client.recent_logs();
+        assert_eq!(capped.len(), MAX_LOG_HISTORY);
+        assert_eq!(capped.first().map(|e| e.seq), Some(201));
+        assert_eq!(capped.last().map(|e| e.seq), Some(1200));
+
         let rx = dispatcher.try_send(CoreCommand::RefreshWindows).unwrap();
         drop(rx);
+    }
+
+    #[test]
+    fn legacy_config_defaults_auto_cook_bounds() {
+        let mut value = serde_json::to_value(CoreConfig::default()).unwrap();
+        for key in [
+            "auto_cook_interval_ms",
+            "auto_cook_stop_on_recover",
+            "auto_cook_timeout_ms",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        value.as_object_mut().unwrap().remove("task_limits");
+        let config: CoreConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.task_limits, TaskLimitsConfig::default());
+        assert_eq!(config.auto_cook_interval_ms, 10);
+        assert!(config.auto_cook_stop_on_recover);
+        assert_eq!(config.auto_cook_timeout_ms, 120_000);
+    }
+
+    #[test]
+    fn legacy_config_defaults_fishing_to_dry_run() {
+        let mut value = serde_json::to_value(CoreConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("fishing_dry_run");
+        value["task_limits"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fishing_total_timeout_ms");
+        let config: CoreConfig = serde_json::from_value(value).unwrap();
+        assert!(config.fishing_dry_run);
+        assert_eq!(config.task_limits.fishing_total_timeout_ms, 120_000);
+    }
+
+    #[test]
+    fn legacy_config_defaults_auto_pick_to_off() {
+        assert!(!CoreConfig::default().pathing_auto_pick);
+        let mut value = serde_json::to_value(CoreConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("pathing_auto_pick");
+        let config: CoreConfig = serde_json::from_value(value).unwrap();
+        assert!(!config.pathing_auto_pick);
+    }
+
+    #[test]
+    fn task_limits_round_trip_and_reject_out_of_range_values() {
+        let config = TaskLimitsConfig {
+            reward_claim_max_clicks: 17,
+            reward_claim_timeout_ms: 45_000,
+            ..TaskLimitsConfig::default()
+        };
+        let restored: TaskLimitsConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(restored, config);
+
+        for invalid in [
+            TaskLimitsConfig {
+                reward_claim_max_clicks: 0,
+                ..Default::default()
+            },
+            TaskLimitsConfig {
+                reward_claim_max_clicks: 101,
+                ..Default::default()
+            },
+            TaskLimitsConfig {
+                reward_claim_timeout_ms: 999,
+                ..Default::default()
+            },
+            TaskLimitsConfig {
+                auto_open_chest_target_lost_timeout_ms: 499,
+                ..Default::default()
+            },
+            TaskLimitsConfig {
+                auto_open_chest_verify_timeout_ms: 30_001,
+                ..Default::default()
+            },
+            TaskLimitsConfig {
+                auto_wood_menu_timeout_ms: 60_001,
+                ..Default::default()
+            },
+            TaskLimitsConfig {
+                auto_wood_empty_ocr_limit: 0,
+                ..Default::default()
+            },
+            TaskLimitsConfig {
+                auto_wood_empty_ocr_limit: 11,
+                ..Default::default()
+            },
+            TaskLimitsConfig {
+                fishing_total_timeout_ms: 999,
+                ..Default::default()
+            },
+            TaskLimitsConfig {
+                fishing_total_timeout_ms: 3_600_001,
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn trigger_lease_status_round_trips_and_legacy_snapshots_default_empty() {
+        let snapshot = UiSnapshot {
+            trigger_leases: vec![TriggerLeaseStatus {
+                id: 7,
+                name: "PathRequest".into(),
+                options: serde_json::json!({"task_name": "Daily route", "request_every_n": 3}),
+            }],
+            ..Default::default()
+        };
+        let restored: UiSnapshot =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        assert_eq!(restored.trigger_leases, snapshot.trigger_leases);
+
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy.as_object_mut().unwrap().remove("trigger_leases");
+        let restored: UiSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(restored.trigger_leases.is_empty());
+    }
+
+    #[test]
+    fn running_and_stopping_states_keep_the_task_lease() {
+        let running = TaskState::Pathing {
+            task_id: 1,
+            task_name: "route".into(),
+            current_index: 1,
+            total_points: 2,
+        };
+        let stopping = TaskState::Stopping {
+            task_id: 1,
+            task_name: "route".into(),
+            current_index: 1,
+            total_points: 2,
+        };
+        assert!(running.is_task_active());
+        assert!(stopping.is_task_active());
+        assert!(
+            TaskState::OpeningChest {
+                task_id: 2,
+                task_name: "自动开箱当前目标".into(),
+            }
+            .is_task_active()
+        );
+        assert!(
+            TaskState::AutoWood {
+                task_id: 3,
+                task_name: "自动砍树（王树瑞佑）".into(),
+            }
+            .is_task_active()
+        );
+        assert!(
+            TaskState::AutoWood {
+                task_id: 1,
+                task_name: "wood".into(),
+            }
+            .is_task_active()
+        );
+        assert!(
+            TaskState::OneKeyExpedition {
+                task_id: 1,
+                task_name: "expedition".into(),
+            }
+            .is_task_active()
+        );
+        assert!(
+            TaskState::Fishing {
+                task_id: 4,
+                task_name: "自动钓鱼".into(),
+            }
+            .is_task_active()
+        );
+        assert!(!TaskState::Idle.is_task_active());
+        assert!(!TaskState::Error("failed".into()).is_task_active());
     }
 
     #[test]

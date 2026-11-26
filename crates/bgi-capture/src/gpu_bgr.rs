@@ -12,7 +12,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_STAGING, ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext,
     ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAIT_TIMEOUT;
 use windows::core::s;
 
@@ -52,6 +54,15 @@ void main_cs(uint3 dt : SV_DispatchThreadID)
     outBuf[o + 2] = rc[2] | (bc[3] << 8) | (gc[3] << 16) | (rc[3] << 24);
 }
 "#;
+
+/// Crop rectangle in source texture coordinates.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Bgr24Crop {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
 
 pub(crate) struct GpuBgr24Packer {
     cs: Option<(ID3D11ComputeShader, ID3D11Buffer)>,
@@ -95,14 +106,17 @@ impl GpuBgr24Packer {
         context: &ID3D11DeviceContext,
         src_tex: &ID3D11Texture2D,
         src_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
-        crop_x: u32,
-        crop_y: u32,
-        out_w: u32,
-        out_h: u32,
+        crop: Bgr24Crop,
     ) -> Result<bool, CaptureError> {
+        let Bgr24Crop {
+            x: crop_x,
+            y: crop_y,
+            width: out_w,
+            height: out_h,
+        } = crop;
         if let Some((cs, cb)) = self.cs.clone() {
             let total_pixels = out_w.saturating_mul(out_h).max(1);
-            let aligned_bytes = ((total_pixels + 3) / 4) * 12;
+            let aligned_bytes = total_pixels.div_ceil(4) * 12;
             self.ensure_pack_buffers(device, aligned_bytes)?;
 
             let mut srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
@@ -118,8 +132,14 @@ impl GpuBgr24Packer {
             let mut srv: Option<ID3D11ShaderResourceView> = None;
             unsafe {
                 device
-                    .CreateShaderResourceView(src_tex, Some(&mut srv_desc as *mut _), Some(&mut srv))
-                    .map_err(|e| CaptureError::Api(format!("CreateShaderResourceView(BGR24) 失败: {e}")))?;
+                    .CreateShaderResourceView(
+                        src_tex,
+                        Some(&mut srv_desc as *mut _),
+                        Some(&mut srv),
+                    )
+                    .map_err(|e| {
+                        CaptureError::Api(format!("CreateShaderResourceView(BGR24) 失败: {e}"))
+                    })?;
             }
             let srv = srv.ok_or_else(|| CaptureError::Api("BGR24 SRV 为空".into()))?;
 
@@ -133,8 +153,8 @@ impl GpuBgr24Packer {
                 context.Unmap(&cb, 0);
             }
 
-            let pixel_groups = (total_pixels + 3) / 4;
-            let thread_groups = (pixel_groups + 63) / 64;
+            let pixel_groups = total_pixels.div_ceil(4);
+            let thread_groups = pixel_groups.div_ceil(64);
             let gpu_buf = self.pack_gpu.as_ref().unwrap();
             let uav = self.pack_uav.as_ref().unwrap();
             let staging_buf = self.pack_staging.as_ref().unwrap();
@@ -215,7 +235,9 @@ impl GpuBgr24Packer {
         let src_base = mapped.pData as *const u8;
         let row_bgr_bytes = (out_w as usize) * 3;
         for y in 0..(out_h as usize) {
-            let src_row = unsafe { std::slice::from_raw_parts(src_base.add(y * src_pitch), (out_w as usize) * 4) };
+            let src_row = unsafe {
+                std::slice::from_raw_parts(src_base.add(y * src_pitch), (out_w as usize) * 4)
+            };
             let dst_row = &mut dst[y * row_bgr_bytes..(y + 1) * row_bgr_bytes];
             for x in 0..(out_w as usize) {
                 let s = x * 4;
@@ -231,7 +253,11 @@ impl GpuBgr24Packer {
         Ok(())
     }
 
-    fn ensure_pack_buffers(&mut self, device: &ID3D11Device, bytes: u32) -> Result<(), CaptureError> {
+    fn ensure_pack_buffers(
+        &mut self,
+        device: &ID3D11Device,
+        bytes: u32,
+    ) -> Result<(), CaptureError> {
         if self.pack_gpu.is_some() && self.pack_bytes == bytes {
             return Ok(());
         }
@@ -270,7 +296,9 @@ impl GpuBgr24Packer {
         unsafe {
             device
                 .CreateUnorderedAccessView(&gpu_buf, Some(&uav_desc), Some(&mut uav))
-                .map_err(|e| CaptureError::Api(format!("CreateUnorderedAccessView(BGR24) 失败: {e}")))?;
+                .map_err(|e| {
+                    CaptureError::Api(format!("CreateUnorderedAccessView(BGR24) 失败: {e}"))
+                })?;
         }
 
         let staging_desc = D3D11_BUFFER_DESC {
@@ -362,7 +390,10 @@ fn ensure_bgra_staging(
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_STAGING,
         BindFlags: 0,
         CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
@@ -390,9 +421,7 @@ fn map_err_to_capture(e: windows::core::Error) -> CaptureError {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_1,
-    };
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_1};
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
         D3D11_SUBRESOURCE_DATA, D3D11CreateDevice,
@@ -428,7 +457,12 @@ mod tests {
         let mut pixels = Vec::with_capacity(4 * 4 * 4);
         for y in 0u8..4 {
             for x in 0u8..4 {
-                pixels.extend_from_slice(&[x * 30 + y * 5, y * 40 + x * 7, 200 - x * 20 - y * 10, 128]);
+                pixels.extend_from_slice(&[
+                    x * 30 + y * 5,
+                    y * 40 + x * 7,
+                    200 - x * 20 - y * 10,
+                    128,
+                ]);
             }
         }
         let desc = D3D11_TEXTURE2D_DESC {
@@ -437,7 +471,10 @@ mod tests {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             CPUAccessFlags: 0,
@@ -456,7 +493,18 @@ mod tests {
         let tex = tex.unwrap();
 
         let used_cs = packer
-            .stage_cropped_bgr24(&dev, &ctx, &tex, DXGI_FORMAT_B8G8R8A8_UNORM, 1, 1, 3, 2)
+            .stage_cropped_bgr24(
+                &dev,
+                &ctx,
+                &tex,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                Bgr24Crop {
+                    x: 1,
+                    y: 1,
+                    width: 3,
+                    height: 2,
+                },
+            )
             .unwrap();
         assert!(used_cs);
 

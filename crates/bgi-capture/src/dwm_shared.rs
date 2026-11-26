@@ -3,8 +3,7 @@ use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, POINT, RECT};
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
-    D3D_FEATURE_LEVEL_11_1,
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11CreateDevice,
@@ -17,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsIc
 use windows::core::{BOOL, s, w};
 
 use crate::CaptureError;
-use crate::gpu_bgr::GpuBgr24Packer;
+use crate::gpu_bgr::{Bgr24Crop, GpuBgr24Packer};
 use crate::pool::{FrameBufferPool, PooledBuffer};
 
 type DwmGetDxSharedSurfaceFn = unsafe extern "system" fn(
@@ -35,7 +34,10 @@ fn resolve_dwm_get_dx_shared_surface() -> Option<DwmGetDxSharedSurfaceFn> {
     *DWM_SHARED_FN.get_or_init(|| unsafe {
         let user32 = GetModuleHandleW(w!("user32.dll")).ok()?;
         let proc_ptr = GetProcAddress(user32, s!("DwmGetDxSharedSurface"))?;
-        Some(transmute::<_, DwmGetDxSharedSurfaceFn>(proc_ptr))
+        Some(transmute::<
+            unsafe extern "system" fn() -> isize,
+            DwmGetDxSharedSurfaceFn,
+        >(proc_ptr))
     })
 }
 
@@ -104,7 +106,10 @@ impl DwmSharedCapturer {
         )
     }
 
-    pub fn capture_bgr(&mut self, pool: &FrameBufferPool) -> Result<(u32, u32, PooledBuffer), CaptureError> {
+    pub fn capture_bgr(
+        &mut self,
+        pool: &FrameBufferPool,
+    ) -> Result<(u32, u32, PooledBuffer), CaptureError> {
         self.capture_region(pool, None)
     }
 
@@ -154,14 +159,16 @@ impl DwmSharedCapturer {
             return Err(CaptureError::FrameNotReady);
         }
 
-        if update_id != 0 && update_id == self.last_update_id && self.cached_w > 0 && roi.is_none() {
+        if update_id != 0 && update_id == self.last_update_id && self.cached_w > 0 && roi.is_none()
+        {
             return Ok(self.checkout_cached_full(pool));
         }
 
         let mut src_tex: Option<ID3D11Texture2D> = None;
         unsafe { self.device.OpenSharedResource(ph_surface, &mut src_tex) }
             .map_err(|e| CaptureError::Api(format!("OpenSharedResource 失败: {e}")))?;
-        let src_tex = src_tex.ok_or_else(|| CaptureError::Api("OpenSharedResource 返回空".into()))?;
+        let src_tex =
+            src_tex.ok_or_else(|| CaptureError::Api("OpenSharedResource 返回空".into()))?;
 
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { src_tex.GetDesc(&mut desc) };
@@ -180,8 +187,12 @@ impl DwmSharedCapturer {
 
         let left = self.offsets.left.min(desc.Width.saturating_sub(1));
         let top = self.offsets.top.min(desc.Height.saturating_sub(1));
-        let client_w = (desc.Width - left).saturating_sub(self.offsets.right).max(1);
-        let client_h = (desc.Height - top).saturating_sub(self.offsets.bottom).max(1);
+        let client_w = (desc.Width - left)
+            .saturating_sub(self.offsets.right)
+            .max(1);
+        let client_h = (desc.Height - top)
+            .saturating_sub(self.offsets.bottom)
+            .max(1);
 
         let (crop_x, crop_y, out_w, out_h) = if let Some((rx, ry, rw, rh)) = roi {
             let cx = left + rx.min(client_w.saturating_sub(1));
@@ -198,16 +209,23 @@ impl DwmSharedCapturer {
             &self.context,
             &src_tex,
             desc.Format,
-            crop_x,
-            crop_y,
-            out_w,
-            out_h,
+            Bgr24Crop {
+                x: crop_x,
+                y: crop_y,
+                width: out_w,
+                height: out_h,
+            },
         )?;
         drop(src_tex);
 
         if roi.is_some() {
-            self.packer
-                .map_staged_bgr24(&self.context, used_cs, out_w, out_h, &mut self.scratch_roi)?;
+            self.packer.map_staged_bgr24(
+                &self.context,
+                used_cs,
+                out_w,
+                out_h,
+                &mut self.scratch_roi,
+            )?;
             let mut out = pool.checkout(self.scratch_roi.len());
             out.as_mut_slice().copy_from_slice(&self.scratch_roi);
             return Ok((out_w, out_h, out));
@@ -264,8 +282,14 @@ fn calc_client_offsets(hwnd: HWND, tex_w: u32, tex_h: u32) -> ClientOffsets {
         return ClientOffsets::default();
     }
     let mut pts = [
-        POINT { x: client_rect.left, y: client_rect.top },
-        POINT { x: client_rect.right, y: client_rect.bottom },
+        POINT {
+            x: client_rect.left,
+            y: client_rect.top,
+        },
+        POINT {
+            x: client_rect.right,
+            y: client_rect.bottom,
+        },
     ];
     unsafe {
         if MapWindowPoints(Some(hwnd), None, &mut pts) == 0 {

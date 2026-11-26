@@ -7,16 +7,14 @@ use std::time::{Duration, Instant};
 
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
-    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
-    GraphicsCaptureSession,
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };
-use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, POINT, RECT, RPC_E_CHANGED_MODE, WPARAM};
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
-    D3D_FEATURE_LEVEL_11_1,
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11CreateDevice,
@@ -33,8 +31,7 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    SetThreadDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, IsIconic, IsWindow, MSG,
@@ -43,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{IInspectable, Interface};
 
 use crate::CaptureError;
-use crate::gpu_bgr::GpuBgr24Packer;
+use crate::gpu_bgr::{Bgr24Crop, GpuBgr24Packer};
 use crate::pool::{FrameBufferPool, PooledBuffer};
 
 const CAPTURE_POOL_SIZE: i32 = 2;
@@ -143,8 +140,12 @@ impl RoInitGuard {
     fn init_mta() -> Result<Self, CaptureError> {
         ensure_winrt_mta_anchor();
         match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
-            Ok(()) => Ok(Self { should_uninit: true }),
-            Err(e) if e.code() == RPC_E_CHANGED_MODE => Ok(Self { should_uninit: false }),
+            Ok(()) => Ok(Self {
+                should_uninit: true,
+            }),
+            Err(e) if e.code() == RPC_E_CHANGED_MODE => Ok(Self {
+                should_uninit: false,
+            }),
             Err(e) => Err(CaptureError::Api(format!("RoInitialize(MTA) 失败: {e}"))),
         }
     }
@@ -255,7 +256,11 @@ impl WgcCapturer {
             .store(packer.is_gpu_cs_active(), Ordering::Relaxed);
 
         let effective_ms = effective_min_interval_ms(min_update_interval_ms);
-        let os_interval_desc = if shared.telemetry.min_interval_supported.load(Ordering::Acquire) {
+        let os_interval_desc = if shared
+            .telemetry
+            .min_interval_supported
+            .load(Ordering::Acquire)
+        {
             format!("{effective_ms}ms")
         } else {
             "SoftOnly".to_string()
@@ -338,12 +343,18 @@ impl WgcCapturer {
             self.shared.telemetry.arrivals.load(Ordering::Relaxed),
             self.shared.telemetry.copied_frames.load(Ordering::Relaxed),
             self.shared.telemetry.recreates.load(Ordering::Relaxed),
-            self.shared.telemetry.throttled_skips.load(Ordering::Relaxed),
+            self.shared
+                .telemetry
+                .throttled_skips
+                .load(Ordering::Relaxed),
         )
     }
 
     /// Captures cropped client frame packed directly as tight `BGR24` bytes.
-    pub fn capture_bgr(&mut self, pool: &FrameBufferPool) -> Result<(u32, u32, PooledBuffer), CaptureError> {
+    pub fn capture_bgr(
+        &mut self,
+        pool: &FrameBufferPool,
+    ) -> Result<(u32, u32, PooledBuffer), CaptureError> {
         self.capture_region_bgr(pool, None)
     }
 
@@ -392,7 +403,8 @@ impl WgcCapturer {
 
         loop {
             let need_wait = (roi.is_none() && self.cached_w == 0) || waited_recreate;
-            let frame_opt = self.take_produced_frame(need_wait || roi.is_some() && self.cached_w == 0, deadline)?;
+            let frame_opt = self
+                .take_produced_frame(need_wait || roi.is_some() && self.cached_w == 0, deadline)?;
 
             let Some((frame, frame_gen)) = frame_opt else {
                 if let Some((rx, ry, rw, rh)) = roi {
@@ -476,10 +488,12 @@ impl WgcCapturer {
                                 &self.d3d_context,
                                 &src_tex,
                                 src_desc.Format,
-                                crop_x,
-                                crop_y,
-                                out_w,
-                                out_h,
+                                Bgr24Crop {
+                                    x: crop_x,
+                                    y: crop_y,
+                                    width: out_w,
+                                    height: out_h,
+                                },
                             )
                             .map(|used_cs| (used_cs, out_w, out_h))
                     }
@@ -553,7 +567,10 @@ impl WgcCapturer {
     }
 
     fn recreate_pool_for_size(&mut self, new_size: SizeInt32) -> Result<(), CaptureError> {
-        self.shared.telemetry.recreates.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .telemetry
+            .recreates
+            .fetch_add(1, Ordering::Relaxed);
         let shared = self.shared.clone();
         let (done_tx, done_rx) =
             mpsc::channel::<Result<(SizeInt32, ClientAreaOffsets, u64), CaptureError>>();
@@ -625,7 +642,8 @@ impl WgcCapturer {
         for row in 0..(rh as usize) {
             let s_off = ((ry as usize) + row) * src_stride + (rx as usize) * 3;
             let d_off = row * row_bytes;
-            dst[d_off..d_off + row_bytes].copy_from_slice(&self.cached_bgr[s_off..s_off + row_bytes]);
+            dst[d_off..d_off + row_bytes]
+                .copy_from_slice(&self.cached_bgr[s_off..s_off + row_bytes]);
         }
         (rw, rh, out)
     }
@@ -639,8 +657,9 @@ impl WgcCapturer {
         }
         self.task_queue.lock().unwrap().push_back(Box::new(f));
         unsafe {
-            PostThreadMessageW(self.wgc_thread_id, WM_WGC_EXEC, WPARAM(0), LPARAM(0))
-                .map_err(|e| CaptureError::Api(format!("PostThreadMessageW(WM_WGC_EXEC) 失败: {e}")))?;
+            PostThreadMessageW(self.wgc_thread_id, WM_WGC_EXEC, WPARAM(0), LPARAM(0)).map_err(
+                |e| CaptureError::Api(format!("PostThreadMessageW(WM_WGC_EXEC) 失败: {e}")),
+            )?;
         }
         Ok(())
     }
@@ -659,7 +678,8 @@ impl Drop for WgcCapturer {
         }
         if self.wgc_thread_id != 0 {
             unsafe {
-                let _ = PostThreadMessageW(self.wgc_thread_id, WM_WGC_SHUTDOWN, WPARAM(0), LPARAM(0));
+                let _ =
+                    PostThreadMessageW(self.wgc_thread_id, WM_WGC_SHUTDOWN, WPARAM(0), LPARAM(0));
             }
         }
         if let Some(handle) = self.thread_handle.take() {
@@ -757,7 +777,9 @@ fn setup_wgc_session(
     shared: &Arc<WgcShared>,
 ) -> Result<(WgcSessionOwner, ID3D11Device, ID3D11DeviceContext), CaptureError> {
     if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
-        return Err(CaptureError::Api("当前系统不支持 Windows Graphics Capture".into()));
+        return Err(CaptureError::Api(
+            "当前系统不支持 Windows Graphics Capture".into(),
+        ));
     }
 
     let (d3d_device, d3d_context) = create_d3d11_device()?;
@@ -776,8 +798,9 @@ fn setup_wgc_session(
     let dxgi_dev: IDXGIDevice = d3d_device
         .cast()
         .map_err(|e| CaptureError::Api(format!("查询 IDXGIDevice 失败: {e}")))?;
-    let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_dev) }
-        .map_err(|e| CaptureError::Api(format!("CreateDirect3D11DeviceFromDXGIDevice 失败: {e}")))?;
+    let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_dev) }.map_err(|e| {
+        CaptureError::Api(format!("CreateDirect3D11DeviceFromDXGIDevice 失败: {e}"))
+    })?;
     let winrt_device: IDirect3DDevice = inspectable
         .cast()
         .map_err(|e| CaptureError::Api(format!("转换 WinRT IDirect3DDevice 失败: {e}")))?;
@@ -827,8 +850,8 @@ fn setup_wgc_session(
 
     let shared_closed = shared.clone();
     let closed_token = item
-        .Closed(&TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(
-            move |_, _| {
+        .Closed(
+            &TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
                 let mut guard = shared_closed.mailbox.lock().unwrap();
                 guard.is_capturing = false;
                 if let Some((old, _)) = guard.produced.take() {
@@ -836,47 +859,51 @@ fn setup_wgc_session(
                 }
                 shared_closed.cv.notify_all();
                 Ok(())
-            },
-        ))
+            }),
+        )
         .map_err(|e| CaptureError::Api(format!("注册 Item.Closed 失败: {e}")))?;
 
     // Sunshine low-latency FrameArrived: drain pool to newest frame, drop unconsumed old frame, ZERO D3D!
     let shared_arrived = shared.clone();
     let frame_arrived_token = frame_pool
-        .FrameArrived(&TypedEventHandler::<
-            Direct3D11CaptureFramePool,
-            IInspectable,
-        >::new(move |sender, _| {
-            let Some(pool) = sender.as_ref() else {
-                return Ok(());
-            };
-            let mut latest: Option<Direct3D11CaptureFrame> = None;
-            while let Ok(next) = pool.TryGetNextFrame() {
-                if let Some(prev) = latest.replace(next) {
-                    let _ = prev.Close();
-                }
-            }
-            let Some(frame) = latest else {
-                return Ok(());
-            };
+        .FrameArrived(
+            &TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
+                move |sender, _| {
+                    let Some(pool) = sender.as_ref() else {
+                        return Ok(());
+                    };
+                    let mut latest: Option<Direct3D11CaptureFrame> = None;
+                    while let Ok(next) = pool.TryGetNextFrame() {
+                        if let Some(prev) = latest.replace(next) {
+                            let _ = prev.Close();
+                        }
+                    }
+                    let Some(frame) = latest else {
+                        return Ok(());
+                    };
 
-            let replaced = {
-                let mut guard = shared_arrived.mailbox.lock().unwrap();
-                if !guard.is_capturing {
-                    let _ = frame.Close();
-                    return Ok(());
-                }
-                let pool_gen = guard.pool_generation;
-                let old = guard.produced.replace((frame, pool_gen));
-                shared_arrived.telemetry.arrivals.fetch_add(1, Ordering::Relaxed);
-                shared_arrived.cv.notify_all();
-                old
-            };
-            if let Some((old_frame, _)) = replaced {
-                let _ = old_frame.Close();
-            }
-            Ok(())
-        }))
+                    let replaced = {
+                        let mut guard = shared_arrived.mailbox.lock().unwrap();
+                        if !guard.is_capturing {
+                            let _ = frame.Close();
+                            return Ok(());
+                        }
+                        let pool_gen = guard.pool_generation;
+                        let old = guard.produced.replace((frame, pool_gen));
+                        shared_arrived
+                            .telemetry
+                            .arrivals
+                            .fetch_add(1, Ordering::Relaxed);
+                        shared_arrived.cv.notify_all();
+                        old
+                    };
+                    if let Some((old_frame, _)) = replaced {
+                        let _ = old_frame.Close();
+                    }
+                    Ok(())
+                },
+            ),
+        )
         .map_err(|e| CaptureError::Api(format!("注册 FrameArrived 失败: {e}")))?;
 
     session
@@ -947,8 +974,14 @@ fn calculate_client_area(hwnd: HWND, cap_size: SizeInt32) -> ClientAreaOffsets {
         return ClientAreaOffsets::default();
     }
     let mut pts = [
-        POINT { x: client_rect.left, y: client_rect.top },
-        POINT { x: client_rect.right, y: client_rect.bottom },
+        POINT {
+            x: client_rect.left,
+            y: client_rect.top,
+        },
+        POINT {
+            x: client_rect.right,
+            y: client_rect.bottom,
+        },
     ];
     unsafe {
         if MapWindowPoints(Some(hwnd), None, &mut pts) == 0 {
@@ -1058,10 +1091,30 @@ mod tests {
     fn software_throttle_gates_overdelivery_without_blocking_first_or_unthrottled() {
         let t0 = Instant::now();
         assert!(!should_throttle_capture(None, false, 100, t0));
-        assert!(!should_throttle_capture(Some(t0), false, 100, t0 + Duration::from_millis(5)));
-        assert!(!should_throttle_capture(Some(t0), true, 0, t0 + Duration::from_millis(5)));
-        assert!(should_throttle_capture(Some(t0), true, 100, t0 + Duration::from_millis(16)));
-        assert!(!should_throttle_capture(Some(t0), true, 100, t0 + Duration::from_millis(100)));
+        assert!(!should_throttle_capture(
+            Some(t0),
+            false,
+            100,
+            t0 + Duration::from_millis(5)
+        ));
+        assert!(!should_throttle_capture(
+            Some(t0),
+            true,
+            0,
+            t0 + Duration::from_millis(5)
+        ));
+        assert!(should_throttle_capture(
+            Some(t0),
+            true,
+            100,
+            t0 + Duration::from_millis(16)
+        ));
+        assert!(!should_throttle_capture(
+            Some(t0),
+            true,
+            100,
+            t0 + Duration::from_millis(100)
+        ));
     }
 
     #[test]

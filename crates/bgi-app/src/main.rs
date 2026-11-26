@@ -1,6 +1,14 @@
+mod capture_host;
+mod commands;
+mod config_store;
 mod core;
+mod cv_service;
+mod fishing_host;
+mod logging;
 mod pathing_host;
+mod task_runtime;
 mod tray;
+mod trigger_runtime;
 mod ui_host;
 
 use bgi_control::{CoreCommand, UiSnapshot, create_control_bus};
@@ -9,33 +17,44 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage,
-    TranslateMessage, WM_QUIT,
+    DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, TranslateMessage,
+    WM_QUIT,
 };
 
 use crate::core::spawn_core_actor;
-use crate::tray::{
-    TrayHost, WM_APP_CAPTURE_ONCE, WM_APP_EMERGENCY_STOP, WM_APP_OPEN_UI,
-};
+use crate::tray::{TrayHost, WM_APP_CAPTURE_ONCE, WM_APP_EMERGENCY_STOP, WM_APP_OPEN_UI};
 use crate::ui_host::{UiHost, WM_APP_CLOSE_UI, WM_APP_QUIT_APP};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let (mut client, dispatcher, core_endpoint) = create_control_bus(UiSnapshot::default());
-    let core_handle = spawn_core_actor(core_endpoint);
+    let persisted_config_path = config_store::config_path();
+    let (initial_config, config_load_error) =
+        config_store::load_initial_config(&persisted_config_path);
+    let initial_snapshot = UiSnapshot {
+        config: initial_config,
+        ..UiSnapshot::default()
+    };
+    let (mut client, dispatcher, core_endpoint) = create_control_bus(initial_snapshot.clone());
+    let _log_guard = logging::init_logging(core_endpoint.log_publisher());
+    if let Some(error) = config_load_error {
+        core_endpoint.emit_log(
+            bgi_control::LogLevel::Error,
+            "Config",
+            format!("{error}；本次使用默认配置，不覆盖损坏文件"),
+        );
+    }
+    tracing::info!(
+        "BetterGI 启动，日志目录: {}",
+        logging::log_dir_path().display()
+    );
+
+    let core_handle = spawn_core_actor(core_endpoint, initial_snapshot, persisted_config_path);
 
     let tray = TrayHost::create().expect("创建系统托盘失败");
     let start_minimized = std::env::args().any(|a| a == "--minimized");

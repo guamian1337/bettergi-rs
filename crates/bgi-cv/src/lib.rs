@@ -1,11 +1,32 @@
 #[cfg(feature = "opencv411")]
+pub mod artifact_salvage;
+pub mod assets;
+#[cfg(feature = "opencv411")]
+pub mod attribute_page;
+#[cfg(feature = "opencv411")]
+pub mod auto_pick_templates;
+#[cfg(feature = "opencv411")]
+pub mod auto_wood_templates;
+#[cfg(feature = "opencv411")]
+pub mod chest_templates;
+#[cfg(feature = "opencv411")]
+pub mod expedition;
+#[cfg(feature = "opencv411")]
+pub mod fishing_templates;
+#[cfg(feature = "opencv411")]
 pub mod matchers;
 #[cfg(feature = "opencv411")]
 pub mod orientation;
 #[cfg(feature = "opencv411")]
+pub mod reward_cards;
+#[cfg(feature = "opencv411")]
+pub mod reward_templates;
+#[cfg(feature = "opencv411")]
 pub mod sift_map;
 #[cfg(feature = "opencv411")]
 pub mod teyvat_minimap;
+#[cfg(feature = "opencv411")]
+pub mod ui_templates;
 
 use thiserror::Error;
 

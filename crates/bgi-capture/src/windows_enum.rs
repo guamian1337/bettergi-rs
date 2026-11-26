@@ -2,7 +2,6 @@ use std::path::Path;
 
 use bgi_control::WindowCandidate;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-use windows::core::BOOL;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -10,6 +9,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
     IsIconic, IsWindowVisible,
 };
+use windows::core::BOOL;
 
 struct EnumCtx {
     preferred_process: String,
@@ -24,7 +24,10 @@ pub fn enumerate_candidate_windows(preferred_process: &str) -> Vec<WindowCandida
     };
 
     unsafe {
-        let _ = EnumWindows(Some(enum_window_proc), LPARAM(&mut ctx as *mut EnumCtx as isize));
+        let _ = EnumWindows(
+            Some(enum_window_proc),
+            LPARAM(&mut ctx as *mut EnumCtx as isize),
+        );
     }
 
     ctx.items.sort_by(|a, b| {

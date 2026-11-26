@@ -4,9 +4,14 @@ use std::time::{Duration, Instant};
 
 use bgi_control::ControlClient;
 use bgi_ui::{BgiAppUi, UiShellAction};
-use egui::{Event, Key, Modifiers, MouseWheelSource, MouseWheelUnit, PointerButton, Pos2, RawInput, ViewportId};
+use egui::{
+    Event, Key, Modifiers, MouseWheelSource, MouseWheelUnit, PointerButton, Pos2, RawInput,
+    ViewportId,
+};
 use egui_wgpu::wgpu;
-use egui_wgpu::wgpu::rwh::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle};
+use egui_wgpu::wgpu::rwh::{
+    RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
+};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::DataExchange::{
@@ -72,10 +77,7 @@ pub struct UiHost {
 }
 
 impl UiHost {
-    pub fn open(
-        tray: &TrayHost,
-        client: &ControlClient,
-    ) -> Result<Self, String> {
+    pub fn open(tray: &TrayHost, client: &ControlClient) -> Result<Self, String> {
         let hinstance: HINSTANCE = unsafe { GetModuleHandleW(None) }
             .map_err(|e| e.to_string())?
             .into();
@@ -136,9 +138,8 @@ impl UiHost {
         input_state.width_px = (rect.right - rect.left).max(1) as u32;
         input_state.height_px = (rect.bottom - rect.top).max(1) as u32;
 
-        let raw_window = Win32WindowHandle::new(
-            NonZeroIsize::new(hwnd.0 as isize).ok_or("HWND 为空")?,
-        );
+        let raw_window =
+            Win32WindowHandle::new(NonZeroIsize::new(hwnd.0 as isize).ok_or("HWND 为空")?);
         let make_target = || wgpu::SurfaceTargetUnsafe::RawHandle {
             raw_display_handle: Some(RawDisplayHandle::Windows(WindowsDisplayHandle::new())),
             raw_window_handle: RawWindowHandle::Win32(raw_window),
@@ -237,6 +238,16 @@ impl UiHost {
         })
     }
 
+    fn discard_unrendered_textures(&mut self, delta: &mut egui::TexturesDelta) {
+        for id in std::mem::take(&mut delta.free) {
+            self.renderer.free_texture(&id);
+        }
+        delta.clear();
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_APP_REPAINT, WPARAM(0), LPARAM(0));
+        }
+    }
+
     pub fn should_repaint(&self) -> bool {
         self.input_state.needs_repaint
             || self.input_state.needs_resize
@@ -281,7 +292,10 @@ impl UiHost {
         );
 
         let raw_input = RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(w_pt, h_pt))),
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(w_pt, h_pt),
+            )),
             viewport_id: ViewportId::ROOT,
             viewports,
             time: Some(self.start_time.elapsed().as_secs_f64()),
@@ -291,7 +305,7 @@ impl UiHost {
         };
 
         let mut shell_action = UiShellAction::None;
-        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+        let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             shell_action = self.app_ui.render(ui, client);
         });
 
@@ -319,12 +333,18 @@ impl UiHost {
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.surface_config);
+                self.discard_unrendered_textures(&mut full_output.textures_delta);
                 return;
             }
-            _ => return,
+            _ => {
+                self.discard_unrendered_textures(&mut full_output.textures_delta);
+                return;
+            }
         };
 
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let clipped = self.egui_ctx.tessellate(full_output.shapes, ppp);
         let screen_desc = ScreenDescriptor {
             size_in_pixels: [self.surface_config.width, self.surface_config.height],
@@ -333,7 +353,8 @@ impl UiHost {
 
         for (id, deltas) in &full_output.textures_delta.set {
             for delta in deltas {
-                self.renderer.update_texture(&self.device, &self.queue, *id, delta);
+                self.renderer
+                    .update_texture(&self.device, &self.queue, *id, delta);
             }
         }
 
@@ -379,6 +400,7 @@ impl UiHost {
         for id in &full_output.textures_delta.free {
             self.renderer.free_texture(id);
         }
+        full_output.textures_delta.clear();
 
         let all_cmds = user_cmds
             .into_iter()
@@ -391,7 +413,8 @@ impl UiHost {
             UiShellAction::HideToTray => {
                 self.input_state.close_requested = true;
                 unsafe {
-                    let _ = PostMessageW(Some(self.tray_hwnd), WM_APP_CLOSE_UI, WPARAM(0), LPARAM(0));
+                    let _ =
+                        PostMessageW(Some(self.tray_hwnd), WM_APP_CLOSE_UI, WPARAM(0), LPARAM(0));
                 }
             }
             UiShellAction::QuitApp => unsafe {
@@ -482,7 +505,9 @@ unsafe extern "system" fn ui_wnd_proc(
             return LRESULT(0);
         }
         WM_MOUSEMOVE => {
-            state.events.push(Event::PointerMoved(state.logical_pos(lparam)));
+            state
+                .events
+                .push(Event::PointerMoved(state.logical_pos(lparam)));
             state.needs_repaint = true;
             return LRESULT(0);
         }

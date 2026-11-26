@@ -8,9 +8,7 @@ use opencv::core::{
     self, BORDER_REPLICATE, CMP_GT, CV_8UC1, Mat, MatTraitConst, MatTraitConstManual, Point,
     Point2f, Rect, RotatedRect, Scalar, Size, Vector,
 };
-use opencv::imgproc::{
-    self, CHAIN_APPROX_SIMPLE, INTER_CUBIC, INTER_LINEAR, RETR_LIST, fill_poly,
-};
+use opencv::imgproc::{self, CHAIN_APPROX_SIMPLE, INTER_CUBIC, INTER_LINEAR, RETR_LIST, fill_poly};
 use opencv::prelude::MatExprTraitConst;
 use ort::environment::Environment;
 use ort::session::Session;
@@ -19,6 +17,15 @@ use ort::value::Tensor;
 use crate::{IdleUnloadPolicy, InferError, OcrRegion, OcrResult, OcrService};
 
 static ORT_ENV: OnceLock<Arc<Environment>> = OnceLock::new();
+
+/// A rectangle in normalized frame coordinates, clamped to `[0..1]` during recognition.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NormalizedRoi {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
 
 #[derive(Debug, Clone)]
 pub struct PaddleOcrPaths {
@@ -30,7 +37,10 @@ pub struct PaddleOcrPaths {
 
 impl PaddleOcrPaths {
     /// Resolves PP-OCRv5 (falling back to V4 if V5 absent) under an `Assets/Model/PaddleOCR` folder.
-    pub fn from_model_root(paddle_dir: impl AsRef<Path>, ort_dll_path: Option<PathBuf>) -> Option<Self> {
+    pub fn from_model_root(
+        paddle_dir: impl AsRef<Path>,
+        ort_dll_path: Option<PathBuf>,
+    ) -> Option<Self> {
         let root = paddle_dir.as_ref();
         let candidates = [
             (
@@ -59,7 +69,7 @@ impl PaddleOcrPaths {
     }
 }
 
-fn find_ort_dll(preferred: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn find_ort_dll(preferred: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = preferred
         && p.exists()
     {
@@ -85,12 +95,16 @@ fn find_ort_dll(preferred: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
-fn get_or_init_ort_env(preferred_dll: Option<&Path>) -> Result<Arc<Environment>, InferError> {
+pub(crate) fn get_or_init_ort_env(
+    preferred_dll: Option<&Path>,
+) -> Result<Arc<Environment>, InferError> {
     if let Some(env) = ORT_ENV.get() {
         return Ok(Arc::clone(env));
     }
     let dll = find_ort_dll(preferred_dll).ok_or_else(|| {
-        InferError::Unavailable("未找到 onnxruntime.dll，请先运行 scripts/setup_native_deps.ps1".into())
+        InferError::Unavailable(
+            "未找到 onnxruntime.dll，请先运行 scripts/setup_native_deps.ps1".into(),
+        )
     })?;
     let env = ort::init_from(&dll)
         .map_err(|e| InferError::Unavailable(format!("加载 {dll:?} 失败: {e}")))?
@@ -137,7 +151,9 @@ pub fn parse_character_dict(yml_path: impl AsRef<Path>) -> Result<Vec<String>, I
     }
 
     if dict.is_empty() {
-        return Err(InferError::Runtime("YAML 中未解析到 PostProcess.character_dict".into()));
+        return Err(InferError::Runtime(
+            "YAML 中未解析到 PostProcess.character_dict".into(),
+        ));
     }
     Ok(dict)
 }
@@ -191,10 +207,16 @@ impl PaddleOcrEngine {
         let env = get_or_init_ort_env(self.paths.ort_dll_path.as_deref())?;
         let labels = parse_character_dict(&self.paths.rec_yml_path)?;
         let det = Session::builder(&env)
-            .and_then(|b| b.with_intra_threads(2)?.commit_from_file(&self.paths.det_model_path))
+            .and_then(|b| {
+                b.with_intra_threads(2)?
+                    .commit_from_file(&self.paths.det_model_path)
+            })
             .map_err(|e| InferError::Runtime(format!("加载 Det 模型失败: {e}")))?;
         let rec = Session::builder(&env)
-            .and_then(|b| b.with_intra_threads(2)?.commit_from_file(&self.paths.rec_model_path))
+            .and_then(|b| {
+                b.with_intra_threads(2)?
+                    .commit_from_file(&self.paths.rec_model_path)
+            })
             .map_err(|e| InferError::Runtime(format!("加载 Rec 模型失败: {e}")))?;
 
         self.models = Some(LoadedModels { det, rec, labels });
@@ -203,6 +225,27 @@ impl PaddleOcrEngine {
 
     pub fn unload_now(&mut self) {
         self.models = None;
+    }
+
+    /// Recognizes an already-cropped BGR or grayscale image without running detection.
+    pub fn recognize_cropped_bgr_mat(&mut self, bgr: &Mat) -> Result<OcrResult, InferError> {
+        self.ensure_loaded()?;
+        let loaded = self.models.as_mut().unwrap();
+        let (text, score) = run_rec(&mut loaded.rec, bgr, &loaded.labels)?;
+        if text.is_empty() || !score.is_finite() {
+            return Ok(OcrResult::default());
+        }
+        Ok(OcrResult {
+            text: text.clone(),
+            regions: vec![crate::OcrRegion {
+                text,
+                score,
+                x: 0.0,
+                y: 0.0,
+                width: bgr.cols().max(0) as f32,
+                height: bgr.rows().max(0) as f32,
+            }],
+        })
     }
 
     pub fn recognize_bgr_mat(&mut self, bgr: &Mat) -> Result<OcrResult, InferError> {
@@ -221,7 +264,9 @@ impl PaddleOcrEngine {
             if score >= 0.5 && !text.is_empty() {
                 let rr = imgproc::min_area_rect(&Vector::<Point2f>::from_slice(&b.points))
                     .map_err(|e| InferError::Runtime(e.message))?;
-                let br = rr.bounding_rect().map_err(|e| InferError::Runtime(e.message))?;
+                let br = rr
+                    .bounding_rect()
+                    .map_err(|e| InferError::Runtime(e.message))?;
                 texts.push(text.clone());
                 regions.push(OcrRegion {
                     text,
@@ -240,30 +285,29 @@ impl PaddleOcrEngine {
         })
     }
 
-    /// Runs OCR inside a normalized `[0..1]` rectangle `(norm_x0, norm_y0)..(norm_x1, norm_y1)`
-    /// and returns `(origin_x, origin_y, OcrResult)` in full-frame coordinates.
+    /// Runs OCR inside a normalized `[0..1]` rectangle and returns
+    /// `(origin_x, origin_y, OcrResult)` in full-frame coordinates.
     pub fn recognize_frame_roi(
         &mut self,
         bytes: &[u8],
         width: u32,
         height: u32,
         is_bgr24: bool,
-        norm_x0: f32,
-        norm_y0: f32,
-        norm_x1: f32,
-        norm_y1: f32,
+        roi: NormalizedRoi,
     ) -> Result<(i32, i32, OcrResult), InferError> {
         let full_bgr = frame_to_bgr_mat(bytes, width, height, is_bgr24)?;
         let iw = full_bgr.cols().max(1);
         let ih = full_bgr.rows().max(1);
-        let x0 = ((norm_x0.clamp(0.0, 1.0) * iw as f32).floor() as i32).clamp(0, iw - 1);
-        let y0 = ((norm_y0.clamp(0.0, 1.0) * ih as f32).floor() as i32).clamp(0, ih - 1);
-        let x1 = ((norm_x1.clamp(0.0, 1.0) * iw as f32).ceil() as i32).clamp(x0 + 1, iw);
-        let y1 = ((norm_y1.clamp(0.0, 1.0) * ih as f32).ceil() as i32).clamp(y0 + 1, ih);
+        let x0 = ((roi.x0.clamp(0.0, 1.0) * iw as f32).floor() as i32).clamp(0, iw - 1);
+        let y0 = ((roi.y0.clamp(0.0, 1.0) * ih as f32).floor() as i32).clamp(0, ih - 1);
+        let x1 = ((roi.x1.clamp(0.0, 1.0) * iw as f32).ceil() as i32).clamp(x0 + 1, iw);
+        let y1 = ((roi.y1.clamp(0.0, 1.0) * ih as f32).ceil() as i32).clamp(y0 + 1, ih);
 
         let view = Mat::roi(&full_bgr, Rect::new(x0, y0, x1 - x0, y1 - y0))
             .map_err(|e| InferError::Runtime(e.message))?;
-        let contiguous = view.try_clone().map_err(|e| InferError::Runtime(e.message))?;
+        let contiguous = view
+            .try_clone()
+            .map_err(|e| InferError::Runtime(e.message))?;
         let res = self.recognize_bgr_mat(&contiguous)?;
         Ok((x0, y0, res))
     }
@@ -273,17 +317,19 @@ impl PaddleOcrEngine {
         bgra: &[u8],
         width: u32,
         height: u32,
-        norm_x0: f32,
-        norm_y0: f32,
-        norm_x1: f32,
-        norm_y1: f32,
+        roi: NormalizedRoi,
     ) -> Result<(i32, i32, OcrResult), InferError> {
-        self.recognize_frame_roi(bgra, width, height, false, norm_x0, norm_y0, norm_x1, norm_y1)
+        self.recognize_frame_roi(bgra, width, height, false, roi)
     }
 }
 
 impl OcrService for PaddleOcrEngine {
-    fn recognize_bgra(&mut self, bgra: &[u8], width: u32, height: u32) -> Result<OcrResult, InferError> {
+    fn recognize_bgra(
+        &mut self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<OcrResult, InferError> {
         let bgr = frame_to_bgr_mat(bgra, width, height, false)?;
         self.recognize_bgr_mat(&bgr)
     }
@@ -310,12 +356,17 @@ fn det_resize_for_test(src: &Mat, limit_side_len: i32) -> Result<Mat, InferError
             .map_err(|e| InferError::Runtime(e.message))?
             .to_mat()
             .map_err(|e| InferError::Runtime(e.message))?;
-        let mut roi = Mat::roi_mut(&mut canvas, opencv::core::Rect::new(0, 0, src.cols(), src.rows()))
+        let mut roi = Mat::roi_mut(
+            &mut canvas,
+            opencv::core::Rect::new(0, 0, src.cols(), src.rows()),
+        )
+        .map_err(|e| InferError::Runtime(e.message))?;
+        src.copy_to(&mut roi)
             .map_err(|e| InferError::Runtime(e.message))?;
-        src.copy_to(&mut roi).map_err(|e| InferError::Runtime(e.message))?;
         canvas
     } else {
-        src.try_clone().map_err(|e| InferError::Runtime(e.message))?
+        src.try_clone()
+            .map_err(|e| InferError::Runtime(e.message))?
     };
 
     let w = padded.cols();
@@ -342,18 +393,51 @@ fn det_resize_for_test(src: &Mat, limit_side_len: i32) -> Result<Mat, InferError
     Ok(out)
 }
 
-fn mat_bgr_to_nchw_norm(bgr: &Mat, mean: [f32; 3], std: [f32; 3], scale: f32) -> Result<Vec<f32>, InferError> {
-    let h = bgr.rows() as usize;
-    let w = bgr.cols() as usize;
+fn mat_bgr_to_nchw_norm(
+    bgr: &Mat,
+    mean: [f32; 3],
+    std: [f32; 3],
+    scale: f32,
+) -> Result<Vec<f32>, InferError> {
+    mat_to_nchw_norm(bgr, mean, std, scale)
+}
+
+fn mat_to_nchw_norm(
+    image: &Mat,
+    mean: [f32; 3],
+    std: [f32; 3],
+    scale: f32,
+) -> Result<Vec<f32>, InferError> {
+    let h = image.rows() as usize;
+    let w = image.cols() as usize;
+    let channels = image.channels() as usize;
+    if channels != 1 && channels != 3 {
+        return Err(InferError::Runtime(format!(
+            "OCR 输入必须为单通道或三通道图像，实际通道数 {channels}"
+        )));
+    }
     let plane = h * w;
     let mut out = vec![0.0f32; 3 * plane];
-    let bytes = bgr.data_bytes().map_err(|e| InferError::Runtime(e.message))?;
+    let bytes = image
+        .data_bytes()
+        .map_err(|e| InferError::Runtime(e.message))?;
 
     for idx in 0..plane {
-        let base = idx * 3;
-        out[idx] = ((bytes[base] as f32) * scale - mean[0]) / std[0];
-        out[plane + idx] = ((bytes[base + 1] as f32) * scale - mean[1]) / std[1];
-        out[2 * plane + idx] = ((bytes[base + 2] as f32) * scale - mean[2]) / std[2];
+        let base = idx * channels;
+        let first = bytes[base] as f32;
+        let second = if channels == 3 {
+            bytes[base + 1] as f32
+        } else {
+            first
+        };
+        let third = if channels == 3 {
+            bytes[base + 2] as f32
+        } else {
+            first
+        };
+        out[idx] = (first * scale - mean[0]) / std[0];
+        out[plane + idx] = (second * scale - mean[1]) / std[1];
+        out[2 * plane + idx] = (third * scale - mean[2]) / std[2];
     }
     Ok(out)
 }
@@ -408,18 +492,28 @@ fn db_post_process(pred: &Mat, src_w: i32, src_h: i32) -> Result<Vec<DetBox>, In
         .map_err(|e| InferError::Runtime(e.message))?;
 
     let mut contours = Vector::<Vector<Point>>::new();
-    imgproc::find_contours(&bitmap, &mut contours, RETR_LIST, CHAIN_APPROX_SIMPLE, Point::default())
-        .map_err(|e| InferError::Runtime(e.message))?;
+    imgproc::find_contours(
+        &bitmap,
+        &mut contours,
+        RETR_LIST,
+        CHAIN_APPROX_SIMPLE,
+        Point::default(),
+    )
+    .map_err(|e| InferError::Runtime(e.message))?;
 
     let pred_w = pred.cols();
     let pred_h = pred.rows();
     let mut out = Vec::new();
 
     for c_idx in 0..contours.len().min(MAX_CANDIDATES) {
-        let contour = contours.get(c_idx).map_err(|e| InferError::Runtime(e.message))?;
+        let contour = contours
+            .get(c_idx)
+            .map_err(|e| InferError::Runtime(e.message))?;
         let mut pts_f = Vector::<Point2f>::with_capacity(contour.len());
         for p_idx in 0..contour.len() {
-            let p = contour.get(p_idx).map_err(|e| InferError::Runtime(e.message))?;
+            let p = contour
+                .get(p_idx)
+                .map_err(|e| InferError::Runtime(e.message))?;
             pts_f.push(Point2f::new(p.x as f32, p.y as f32));
         }
 
@@ -466,10 +560,21 @@ fn min_box_from_rect(rect: &RotatedRect) -> ([Point2f; 4], f32) {
     rect.points(&mut corners).unwrap_or_default();
     corners.sort_by(|a, b| a.x.total_cmp(&b.x));
 
-    let (idx1, idx4) = if corners[1].y > corners[0].y { (0, 1) } else { (1, 0) };
-    let (idx2, idx3) = if corners[3].y > corners[2].y { (2, 3) } else { (3, 2) };
+    let (idx1, idx4) = if corners[1].y > corners[0].y {
+        (0, 1)
+    } else {
+        (1, 0)
+    };
+    let (idx2, idx3) = if corners[3].y > corners[2].y {
+        (2, 3)
+    } else {
+        (3, 2)
+    };
     let short = rect.size.width.min(rect.size.height);
-    ([corners[idx1], corners[idx2], corners[idx3], corners[idx4]], short)
+    (
+        [corners[idx1], corners[idx2], corners[idx3], corners[idx4]],
+        short,
+    )
 }
 
 fn inflate_rect_box(pts: &Vector<Point2f>, distance: f32) -> Result<RotatedRect, InferError> {
@@ -480,10 +585,30 @@ fn inflate_rect_box(pts: &Vector<Point2f>, distance: f32) -> Result<RotatedRect,
 }
 
 fn box_score(box_pts: &[Point2f; 4], pred: &Mat) -> Result<f32, InferError> {
-    let xmin = box_pts.iter().map(|p| p.x.floor() as i32).min().unwrap_or(0).clamp(0, pred.cols() - 1);
-    let xmax = box_pts.iter().map(|p| p.x.ceil() as i32).max().unwrap_or(0).clamp(0, pred.cols() - 1);
-    let ymin = box_pts.iter().map(|p| p.y.floor() as i32).min().unwrap_or(0).clamp(0, pred.rows() - 1);
-    let ymax = box_pts.iter().map(|p| p.y.ceil() as i32).max().unwrap_or(0).clamp(0, pred.rows() - 1);
+    let xmin = box_pts
+        .iter()
+        .map(|p| p.x.floor() as i32)
+        .min()
+        .unwrap_or(0)
+        .clamp(0, pred.cols() - 1);
+    let xmax = box_pts
+        .iter()
+        .map(|p| p.x.ceil() as i32)
+        .max()
+        .unwrap_or(0)
+        .clamp(0, pred.cols() - 1);
+    let ymin = box_pts
+        .iter()
+        .map(|p| p.y.floor() as i32)
+        .min()
+        .unwrap_or(0)
+        .clamp(0, pred.rows() - 1);
+    let ymax = box_pts
+        .iter()
+        .map(|p| p.y.ceil() as i32)
+        .max()
+        .unwrap_or(0)
+        .clamp(0, pred.rows() - 1);
 
     let w = (xmax - xmin + 1).max(1);
     let h = (ymax - ymin + 1).max(1);
@@ -498,8 +623,15 @@ fn box_score(box_pts: &[Point2f; 4], pred: &Mat) -> Result<f32, InferError> {
     }
     let mut polys = Vector::<Vector<Point>>::new();
     polys.push(poly);
-    fill_poly(&mut mask, &polys, Scalar::all(255.0), imgproc::LINE_8, 0, Point::default())
-        .map_err(|e| InferError::Runtime(e.message))?;
+    fill_poly(
+        &mut mask,
+        &polys,
+        Scalar::all(255.0),
+        imgproc::LINE_8,
+        0,
+        Point::default(),
+    )
+    .map_err(|e| InferError::Runtime(e.message))?;
 
     let crop = Mat::roi(pred, opencv::core::Rect::new(xmin, ymin, w, h))
         .map_err(|e| InferError::Runtime(e.message))?;
@@ -524,7 +656,13 @@ fn dist_2f(a: Point2f, b: Point2f) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
-fn map_to_source(pts: &[Point2f; 4], pred_w: i32, pred_h: i32, src_w: i32, src_h: i32) -> [Point2f; 4] {
+fn map_to_source(
+    pts: &[Point2f; 4],
+    pred_w: i32,
+    pred_h: i32,
+    src_w: i32,
+    src_h: i32,
+) -> [Point2f; 4] {
     let sx = (src_w as f32) / (pred_w as f32);
     let sy = (src_h as f32) / (pred_h as f32);
     let mut out = [Point2f::default(); 4];
@@ -598,16 +736,27 @@ fn get_rotate_crop_image(src: &Mat, pts: &[Point2f; 4]) -> Result<Mat, InferErro
     Ok(cropped)
 }
 
-fn run_rec(session: &mut Session, crop_bgr: &Mat, labels: &[String]) -> Result<(String, f32), InferError> {
+fn run_rec(
+    session: &mut Session,
+    crop_bgr: &Mat,
+    labels: &[String],
+) -> Result<(String, f32), InferError> {
     const MODEL_H: i32 = 48;
     let ratio = (crop_bgr.cols() as f64) / (crop_bgr.rows().max(1) as f64);
     let target_w = ((MODEL_H as f64) * ratio).ceil().max(1.0) as i32;
 
     let mut resized = Mat::default();
-    imgproc::resize(crop_bgr, &mut resized, Size::new(target_w, MODEL_H), 0.0, 0.0, INTER_LINEAR)
-        .map_err(|e| InferError::Runtime(e.message))?;
+    imgproc::resize(
+        crop_bgr,
+        &mut resized,
+        Size::new(target_w, MODEL_H),
+        0.0,
+        0.0,
+        INTER_LINEAR,
+    )
+    .map_err(|e| InferError::Runtime(e.message))?;
 
-    let nchw = mat_bgr_to_nchw_norm(&resized, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 1.0 / 255.0)?;
+    let nchw = mat_to_nchw_norm(&resized, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 1.0 / 255.0)?;
     let tensor = Tensor::from_array(([1usize, 3, MODEL_H as usize, target_w as usize], nchw))
         .map_err(|e| InferError::Runtime(format!("Rec Tensor 构造失败: {e}")))?;
 
@@ -686,7 +835,10 @@ mod tests {
         );
         let res = engine.recognize_bgr_mat(&mat).unwrap();
         println!("OCR output: {:?}", res.text);
-        assert!(!res.text.trim().is_empty(), "OCR output should not be empty");
+        assert!(
+            !res.text.trim().is_empty(),
+            "OCR output should not be empty"
+        );
         assert!(engine.is_loaded());
 
         std::thread::sleep(Duration::from_millis(5));

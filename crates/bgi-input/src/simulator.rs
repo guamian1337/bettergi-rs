@@ -1,21 +1,22 @@
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, MOUSE_EVENT_FLAGS,
-    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-    MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEEVENTF_WHEEL, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, IsIconic, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    GetClientRect, GetForegroundWindow, GetSystemMetrics, IsIconic, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE, SetForegroundWindow,
+    ShowWindow,
 };
 
 const WHEEL_DELTA_NOTCH: i32 = 120;
 
-fn send_mouse(dw_flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, mouse_data: u32) {
+fn send_mouse(dw_flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, mouse_data: u32) -> bool {
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -29,9 +30,15 @@ fn send_mouse(dw_flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, mouse_data: u32) {
             },
         },
     };
-    unsafe {
-        let _ = SendInput(&[input], size_of::<INPUT>() as i32);
-    }
+    unsafe { SendInput(&[input], size_of::<INPUT>() as i32) == 1 }
+}
+
+fn has_nonzero_frame_size(frame_size: (u32, u32)) -> bool {
+    frame_size.0 > 0 && frame_size.1 > 0
+}
+
+fn window_has_expected_client_size(hwnd: isize, frame_size: (u32, u32)) -> bool {
+    window_client_size(hwnd) == Some(frame_size)
 }
 
 pub fn focus_window(hwnd: isize) {
@@ -45,6 +52,23 @@ pub fn focus_window(hwnd: isize) {
         }
         let _ = SetForegroundWindow(h);
     }
+}
+
+pub fn window_client_size(hwnd: isize) -> Option<(u32, u32)> {
+    if hwnd == 0 {
+        return None;
+    }
+    let mut rect = RECT::default();
+    if !unsafe { GetClientRect(HWND(hwnd as *mut _), &mut rect) }.is_ok() {
+        return None;
+    }
+    let width = rect.right.saturating_sub(rect.left);
+    let height = rect.bottom.saturating_sub(rect.top);
+    (width > 0 && height > 0).then_some((width as u32, height as u32))
+}
+
+pub fn is_foreground_window(hwnd: isize) -> bool {
+    hwnd != 0 && unsafe { GetForegroundWindow() == HWND(hwnd as *mut _) }
 }
 
 pub fn window_dpi_scale(hwnd: isize) -> f32 {
@@ -97,20 +121,74 @@ pub fn key_tap(vk: u16, hold_ms: u64) {
     key_up(vk);
 }
 
+pub fn key_tap_checked(
+    hwnd: isize,
+    vk: u16,
+    hold_ms: u64,
+    frame_size: (u32, u32),
+) -> Result<(), &'static str> {
+    key_tap_checked_if(hwnd, vk, hold_ms, frame_size, || true)
+}
+
+pub fn key_tap_checked_if(
+    hwnd: isize,
+    vk: u16,
+    hold_ms: u64,
+    frame_size: (u32, u32),
+    mut can_input: impl FnMut() -> bool,
+) -> Result<(), &'static str> {
+    if hwnd == 0 {
+        return Err("游戏窗口句柄无效，未按下按键");
+    }
+    if !has_nonzero_frame_size(frame_size) {
+        return Err("游戏客户区尺寸无效，未按下按键");
+    }
+    if !window_has_expected_client_size(hwnd, frame_size) {
+        return Err("游戏客户区尺寸已变化，未按下按键");
+    }
+    if !is_foreground_window(hwnd) {
+        return Err("游戏窗口不在前台，未按下按键");
+    }
+    if !can_input() {
+        return Err("输入安全条件已变化，未按下按键");
+    }
+    if !window_has_expected_client_size(hwnd, frame_size) {
+        return Err("发送前游戏客户区尺寸已变化，未按下按键");
+    }
+    if !is_foreground_window(hwnd) {
+        return Err("发送前游戏窗口失焦，未按下按键");
+    }
+    if !can_input() {
+        return Err("发送前输入安全条件已变化，未按下按键");
+    }
+    let pressed = send_key(vk, false);
+    if !pressed {
+        return Err("按键按下输入发送失败");
+    }
+    if hold_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+    }
+    if !send_key(vk, true) {
+        release_all_keys();
+        return Err("按键释放输入发送失败");
+    }
+    Ok(())
+}
+
 pub fn mouse_move_rel(dx: i32, dy: i32) {
     send_mouse(MOUSEEVENTF_MOVE, dx, dy, 0);
 }
 
-pub fn mouse_move_to_client(hwnd: isize, client_x: i32, client_y: i32) {
+fn mouse_move_to_client_checked(hwnd: isize, client_x: i32, client_y: i32) -> bool {
     if hwnd == 0 {
-        return;
+        return false;
     }
     let mut pt = POINT {
         x: client_x,
         y: client_y,
     };
     if unsafe { !ClientToScreen(HWND(hwnd as *mut _), &mut pt).as_bool() } {
-        return;
+        return false;
     }
     let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
     let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
@@ -128,15 +206,98 @@ pub fn mouse_move_to_client(hwnd: isize, client_x: i32, client_y: i32) {
         norm_x,
         norm_y,
         0,
-    );
+    )
+}
+
+pub fn mouse_move_to_client(hwnd: isize, client_x: i32, client_y: i32) {
+    let _ = mouse_move_to_client_checked(hwnd, client_x, client_y);
+}
+
+pub fn mouse_wheel_notch_checked(
+    hwnd: isize,
+    client_x: i32,
+    client_y: i32,
+    frame_size: (u32, u32),
+    notches: i32,
+) -> Result<(), &'static str> {
+    if notches != -1 && notches != 1 {
+        return Err("滚轮步数必须为 -1 或 1");
+    }
+    if window_client_size(hwnd) != Some(frame_size) {
+        return Err("游戏客户区尺寸已变化，未滚动");
+    }
+    if !is_foreground_window(hwnd) {
+        return Err("游戏窗口不在前台，未滚动");
+    }
+    if client_x < 0
+        || client_y < 0
+        || client_x >= frame_size.0 as i32
+        || client_y >= frame_size.1 as i32
+    {
+        return Err("滚动坐标越界，未滚动");
+    }
+    if !mouse_move_to_client_checked(hwnd, client_x, client_y) {
+        return Err("移动鼠标失败，未滚动");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    if window_client_size(hwnd) != Some(frame_size) {
+        return Err("移动后游戏客户区尺寸已变化，未滚动");
+    }
+    if !is_foreground_window(hwnd) {
+        return Err("移动后游戏窗口失焦，未滚动");
+    }
+    let delta = if notches > 0 {
+        WHEEL_DELTA_NOTCH as u32
+    } else {
+        (-WHEEL_DELTA_NOTCH) as u32
+    };
+    if !send_mouse(MOUSEEVENTF_WHEEL, 0, 0, delta) {
+        return Err("滚轮输入发送失败");
+    }
+    Ok(())
 }
 
 pub fn mouse_left_down() {
     send_mouse(MOUSEEVENTF_LEFTDOWN, 0, 0, 0);
 }
 
+/// Presses the left mouse button after validating and rechecking the target window.
+pub fn mouse_left_down_checked(hwnd: isize, frame_size: (u32, u32)) -> Result<(), &'static str> {
+    if hwnd == 0 {
+        return Err("游戏窗口句柄无效，未按下鼠标左键");
+    }
+    if !has_nonzero_frame_size(frame_size) {
+        return Err("游戏客户区尺寸无效，未按下鼠标左键");
+    }
+    if !window_has_expected_client_size(hwnd, frame_size) {
+        return Err("游戏客户区尺寸已变化，未按下鼠标左键");
+    }
+    if !is_foreground_window(hwnd) {
+        return Err("游戏窗口不在前台，未按下鼠标左键");
+    }
+    if !window_has_expected_client_size(hwnd, frame_size) {
+        return Err("发送前游戏客户区尺寸已变化，未按下鼠标左键");
+    }
+    if !is_foreground_window(hwnd) {
+        return Err("发送前游戏窗口失焦，未按下鼠标左键");
+    }
+    if !send_mouse(MOUSEEVENTF_LEFTDOWN, 0, 0, 0) {
+        return Err("鼠标左键按下输入发送失败");
+    }
+    Ok(())
+}
+
 pub fn mouse_left_up() {
     send_mouse(MOUSEEVENTF_LEFTUP, 0, 0, 0);
+}
+
+/// Releases the left mouse button regardless of the target window's current state.
+pub fn mouse_left_up_checked() -> Result<(), &'static str> {
+    if send_mouse(MOUSEEVENTF_LEFTUP, 0, 0, 0) {
+        Ok(())
+    } else {
+        Err("鼠标左键松开输入发送失败")
+    }
 }
 
 pub fn mouse_left_click() {
@@ -150,37 +311,74 @@ pub fn mouse_left_click_client(hwnd: isize, client_x: i32, client_y: i32) {
     mouse_left_click();
 }
 
+/// Moves to a client-space target, then rechecks foreground immediately before clicking.
+pub fn mouse_left_click_client_checked(hwnd: isize, client_x: i32, client_y: i32) -> bool {
+    mouse_move_to_client(hwnd, client_x, client_y);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    if !is_foreground_window(hwnd) {
+        return false;
+    }
+    mouse_left_click();
+    true
+}
+
 pub fn mouse_drag_client(hwnd: isize, x1: i32, y1: i32, x2: i32, y2: i32) {
     mouse_move_to_client(hwnd, x1, y1);
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::thread::sleep(std::time::Duration::from_millis(45));
     mouse_left_down();
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    const STEPS: i32 = 4;
-    for step in 1..=STEPS {
-        let sx = x1 + ((x2 - x1) * step) / STEPS;
-        let sy = y1 + ((y2 - y1) * step) / STEPS;
+    std::thread::sleep(std::time::Duration::from_millis(45));
+
+    let dx = (x2 - x1) as f64;
+    let dy = (y2 - y1) as f64;
+    let dist = (dx * dx + dy * dy).sqrt();
+    let steps = ((dist / 42.0).ceil() as i32).clamp(6, 36);
+
+    for step in 1..=steps {
+        let t = (step as f64) / (steps as f64);
+        // Quadratic ease-out slows near release to suppress map flick inertia.
+        let eased = 1.0 - (1.0 - t) * (1.0 - t);
+        let sx = (x1 as f64 + dx * eased).round() as i32;
+        let sy = (y1 as f64 + dy * eased).round() as i32;
         mouse_move_to_client(hwnd, sx, sy);
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(12));
     }
+
+    // Hold briefly at destination before releasing so Genshin cancels map inertia.
+    std::thread::sleep(std::time::Duration::from_millis(65));
     mouse_left_up();
-    std::thread::sleep(std::time::Duration::from_millis(60));
+    std::thread::sleep(std::time::Duration::from_millis(50));
 }
 
 pub fn mouse_wheel(notches: i32) {
     if notches == 0 {
         return;
     }
-    send_mouse(
-        MOUSEEVENTF_WHEEL,
-        0,
-        0,
-        (notches.saturating_mul(WHEEL_DELTA_NOTCH)) as u32,
-    );
+    let count = notches.abs().min(20);
+    let delta = if notches > 0 {
+        WHEEL_DELTA_NOTCH
+    } else {
+        -WHEEL_DELTA_NOTCH
+    } as u32;
+    for i in 0..count {
+        send_mouse(MOUSEEVENTF_WHEEL, 0, 0, delta);
+        if i + 1 < count {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+pub fn mouse_right_down() {
+    send_mouse(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0);
+}
+
+pub fn mouse_right_up() {
+    send_mouse(MOUSEEVENTF_RIGHTUP, 0, 0, 0);
 }
 
 pub fn mouse_right_click() {
-    send_mouse(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0);
-    send_mouse(MOUSEEVENTF_RIGHTUP, 0, 0, 0);
+    mouse_right_down();
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    mouse_right_up();
 }
 
 /// Releases common movement/modifier keys and mouse buttons on emergency stop.
@@ -210,13 +408,22 @@ pub fn release_all_keys() {
                 },
             },
         },
+        INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dwFlags: MOUSEEVENTF_MIDDLEUP,
+                    ..Default::default()
+                },
+            },
+        },
     ];
     unsafe {
         let _ = SendInput(&up_buttons, size_of::<INPUT>() as i32);
     }
 }
 
-fn send_key(vk: u16, up: bool) {
+fn send_key(vk: u16, up: bool) -> bool {
     let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
     let mut flags = KEYBD_EVENT_FLAGS(0);
     if scan != 0 {
@@ -241,7 +448,32 @@ fn send_key(vk: u16, up: bool) {
             },
         },
     };
-    unsafe {
-        let _ = SendInput(&[input], size_of::<INPUT>() as i32);
+    unsafe { SendInput(&[input], size_of::<INPUT>() as i32) == 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_nonzero_frame_size, key_tap_checked_if, mouse_left_down_checked};
+
+    #[test]
+    fn checked_key_tap_rejects_invalid_targets_and_failed_guard() {
+        assert!(key_tap_checked_if(0, 0x46, 0, (1920, 1080), || panic!("guard called")).is_err());
+        assert!(key_tap_checked_if(0, 0x46, 0, (0, 1080), || true).is_err());
+    }
+
+    #[test]
+    fn frame_size_requires_both_dimensions_to_be_nonzero() {
+        assert!(has_nonzero_frame_size((1920, 1080)));
+        assert!(has_nonzero_frame_size((1, 1)));
+        assert!(!has_nonzero_frame_size((0, 1080)));
+        assert!(!has_nonzero_frame_size((1920, 0)));
+        assert!(!has_nonzero_frame_size((0, 0)));
+    }
+
+    #[test]
+    fn invalid_window_and_frame_reject_mouse_down_without_os_input() {
+        assert!(mouse_left_down_checked(0, (1920, 1080)).is_err());
+        assert!(mouse_left_down_checked(0, (0, 1080)).is_err());
+        assert!(mouse_left_down_checked(0, (1920, 0)).is_err());
     }
 }

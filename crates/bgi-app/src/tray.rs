@@ -10,8 +10,8 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyIcon, DestroyMenu, DestroyWindow, GetCursorPos, HICON, ICON_BIG, ICON_SMALL, ICONINFO,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DestroyWindow, GetCursorPos, HICON, ICON_BIG, ICON_SMALL, ICONINFO,
     IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage,
     RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
     TrackPopupMenu, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
@@ -44,10 +44,7 @@ impl TrayHost {
         let (hicon, owns_icon) = create_logo_hicon()
             .map(|h| (h, true))
             .unwrap_or_else(|| unsafe {
-                (
-                    LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
-                    false,
-                )
+                (LoadIconW(None, IDI_APPLICATION).unwrap_or_default(), false)
             });
 
         let wc = WNDCLASSW {

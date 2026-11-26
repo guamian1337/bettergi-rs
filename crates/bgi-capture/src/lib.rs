@@ -2,6 +2,7 @@ pub mod bitblt;
 pub mod dwm_shared;
 pub mod gpu_bgr;
 pub mod pool;
+pub mod replay;
 pub mod wgc;
 pub mod windows_enum;
 
@@ -11,6 +12,7 @@ use thiserror::Error;
 pub use bitblt::BitBltCapturer;
 pub use dwm_shared::DwmSharedCapturer;
 pub use pool::{FrameBufferPool, PooledBuffer};
+pub use replay::{FrameRecord, FrameRecorder, FrameReplay, ReplayError};
 pub use wgc::WgcCapturer;
 pub use windows_enum::enumerate_candidate_windows;
 
@@ -52,7 +54,11 @@ pub enum CapturerBackend {
 }
 
 impl CapturerBackend {
-    pub fn open(hwnd: isize, mode: CaptureMode, min_update_interval_ms: u32) -> Result<Self, CaptureError> {
+    pub fn open(
+        hwnd: isize,
+        mode: CaptureMode,
+        min_update_interval_ms: u32,
+    ) -> Result<Self, CaptureError> {
         match mode {
             CaptureMode::BitBlt => Ok(Self::BitBlt(BitBltCapturer::new(hwnd)?)),
             CaptureMode::Wgc => Ok(Self::Wgc(WgcCapturer::new(hwnd, min_update_interval_ms)?)),
@@ -170,6 +176,13 @@ impl CapturerBackend {
     }
 }
 
+struct PreviewPixels<'a> {
+    width: u32,
+    height: u32,
+    pixels: &'a [u8],
+    format: PixelFormat,
+}
+
 /// Converts a captured `BGR24` or `BGRA32` buffer into a downsampled `RGBA` `FramePreview`.
 pub fn frame_to_preview(
     seq: u64,
@@ -180,10 +193,12 @@ pub fn frame_to_preview(
 ) -> FramePreview {
     pixels_to_preview(
         seq,
-        frame.width,
-        frame.height,
-        frame.data.as_slice(),
-        frame.format,
+        PreviewPixels {
+            width: frame.width,
+            height: frame.height,
+            pixels: frame.data.as_slice(),
+            format: frame.format,
+        },
         max_w,
         max_h,
         capture_ms,
@@ -202,10 +217,12 @@ pub fn bgra_to_preview(
 ) -> FramePreview {
     pixels_to_preview(
         seq,
-        src_w,
-        src_h,
-        bgra,
-        PixelFormat::Bgra32,
+        PreviewPixels {
+            width: src_w,
+            height: src_h,
+            pixels: bgra,
+            format: PixelFormat::Bgra32,
+        },
         max_w,
         max_h,
         capture_ms,
@@ -214,14 +231,17 @@ pub fn bgra_to_preview(
 
 fn pixels_to_preview(
     seq: u64,
-    src_w: u32,
-    src_h: u32,
-    pixels: &[u8],
-    format: PixelFormat,
+    source: PreviewPixels<'_>,
     max_w: u32,
     max_h: u32,
     capture_ms: f32,
 ) -> FramePreview {
+    let PreviewPixels {
+        width: src_w,
+        height: src_h,
+        pixels,
+        format,
+    } = source;
     let bpp = match format {
         PixelFormat::Bgra32 => 4usize,
         PixelFormat::Bgr24 => 3usize,
@@ -246,7 +266,9 @@ fn pixels_to_preview(
     let dst_h = ((src_h as f32) * scale).round().max(1.0) as u32;
 
     let sx_lut: Vec<usize> = (0..dst_w)
-        .map(|dx| (((dx as u64) * (src_w as u64) / (dst_w as u64)).min((src_w - 1) as u64) as usize) * bpp)
+        .map(|dx| {
+            (((dx as u64) * (src_w as u64) / (dst_w as u64)).min((src_w - 1) as u64) as usize) * bpp
+        })
         .collect();
     let src_stride = (src_w as usize) * bpp;
     let dst_stride = (dst_w as usize) * 4;

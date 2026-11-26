@@ -12,7 +12,7 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE,
-    MSG, PostMessageW, PostQuitMessage, RegisterClassW, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1,
+    MSG, PostMessageW, PostQuitMessage, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RegisterClassW,
     TranslateMessage, WM_APP, WM_CLOSE, WM_DESTROY, WM_INPUT, WNDCLASSW,
 };
 use windows::core::{PCWSTR, w};
@@ -167,7 +167,11 @@ impl WindowUserData {
                         vk: norm_vk,
                         modifiers: mask,
                     };
-                    if let Some(slot) = guard.bindings.iter_mut().find(|b| b.action == target_action) {
+                    if let Some(slot) = guard
+                        .bindings
+                        .iter_mut()
+                        .find(|b| b.action == target_action)
+                    {
                         *slot = binding.clone();
                     } else {
                         guard.bindings.push(binding.clone());

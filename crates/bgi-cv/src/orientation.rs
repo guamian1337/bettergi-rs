@@ -1,11 +1,11 @@
 use opencv::core::{
-    self, BORDER_CONSTANT, CMP_EQ, CMP_LT, CV_32F, CV_32FC1, CV_8UC1, CV_8UC3, Mat,
-    MatTraitConst, MatTraitConstManual, Point, Point2f, Rect, Scalar, Size, Vector,
+    self, BORDER_CONSTANT, CMP_EQ, CMP_LT, CV_8UC1, CV_8UC3, CV_32F, CV_32FC1, Mat, MatTraitConst,
+    MatTraitConstManual, Point, Point2f, Rect, Scalar, Size, Vector,
 };
 use opencv::imgproc::{
     self, CHAIN_APPROX_SIMPLE, COLOR_BGR2GRAY, COLOR_BGR2HLS_FULL, COLOR_BGR2HSV, COLOR_GRAY2BGR,
-    INTER_CUBIC, INTER_LINEAR, INTER_NEAREST, MORPH_CLOSE, MORPH_ELLIPSE, MORPH_OPEN, RETR_EXTERNAL,
-    THRESH_BINARY, WARP_POLAR_LINEAR,
+    INTER_CUBIC, INTER_LINEAR, INTER_NEAREST, MORPH_CLOSE, MORPH_ELLIPSE, MORPH_OPEN,
+    RETR_EXTERNAL, THRESH_BINARY, WARP_POLAR_LINEAR,
 };
 use opencv::prelude::{MatExprTraitConst, MatTrait};
 
@@ -29,7 +29,11 @@ fn linear_spaced(a: f32, b: f32, n: usize, endpoint: bool) -> Vec<f32> {
     if n == 0 {
         return Vec::new();
     }
-    let denom = if endpoint && n > 1 { (n - 1) as f32 } else { n as f32 };
+    let denom = if endpoint && n > 1 {
+        (n - 1) as f32
+    } else {
+        n as f32
+    };
     (0..n).map(|i| a + (b - a) * (i as f32) / denom).collect()
 }
 
@@ -62,7 +66,12 @@ pub struct MaskCalculator {
 
 impl MaskCalculator {
     pub fn new() -> Result<Self, CvError> {
-        let x_arr = linear_spaced(-(MINIMAP_SIZE as f32) / 2.0, (MINIMAP_SIZE as f32) / 2.0, MINIMAP_SIZE as usize, false);
+        let x_arr = linear_spaced(
+            -(MINIMAP_SIZE as f32) / 2.0,
+            (MINIMAP_SIZE as f32) / 2.0,
+            MINIMAP_SIZE as usize,
+            false,
+        );
         let x_base = Mat::from_slice(&x_arr)?;
         let x_row = x_base.reshape(1, 1)?;
         let x_mat = core::repeat(&x_row, MINIMAP_SIZE, 1)?;
@@ -96,8 +105,20 @@ impl MaskCalculator {
 
         let mut alpha_mask1 = Mat::default();
         let mut alpha_mask2 = Mat::default();
-        imgproc::cvt_color(&alpha1_gray, &mut alpha_mask1, COLOR_GRAY2BGR, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
-        imgproc::cvt_color(&alpha2_gray, &mut alpha_mask2, COLOR_GRAY2BGR, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+        imgproc::cvt_color(
+            &alpha1_gray,
+            &mut alpha_mask1,
+            COLOR_GRAY2BGR,
+            0,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
+        imgproc::cvt_color(
+            &alpha2_gray,
+            &mut alpha_mask2,
+            COLOR_GRAY2BGR,
+            0,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
 
         let mut circle_mask = Mat::zeros(MINIMAP_SIZE, MINIMAP_SIZE, CV_8UC1)?.to_mat()?;
         imgproc::circle(
@@ -110,7 +131,8 @@ impl MaskCalculator {
             0,
         )?;
 
-        let kernel5 = imgproc::get_structuring_element(MORPH_ELLIPSE, Size::new(5, 5), Point::new(-1, -1))?;
+        let kernel5 =
+            imgproc::get_structuring_element(MORPH_ELLIPSE, Size::new(5, 5), Point::new(-1, -1))?;
         let out_mat_f = Mat::zeros(MINIMAP_SIZE, MINIMAP_SIZE, core::CV_32FC3)?.to_mat()?;
         let out_mask = Mat::zeros(MINIMAP_SIZE, MINIMAP_SIZE, CV_8UC1)?.to_mat()?;
 
@@ -164,7 +186,12 @@ impl MaskCalculator {
         self.create_bg_mask(&out_mat)?;
 
         let mut final_mask = Mat::default();
-        core::bitwise_and(&self.circle_mask, &self.out_mask, &mut final_mask, &core::no_array())?;
+        core::bitwise_and(
+            &self.circle_mask,
+            &self.out_mask,
+            &mut final_mask,
+            &core::no_array(),
+        )?;
         self.out_mask = final_mask.try_clone()?;
         Ok((out_mat, final_mask))
     }
@@ -187,19 +214,36 @@ impl MaskCalculator {
         let mut eq_mask = Mat::default();
         core::compare(&cmax, &cmin, &mut eq_mask, CMP_EQ)?;
         let mut range_mask = Mat::default();
-        core::in_range(&cmax, &Scalar::all(50.0), &Scalar::all(127.0), &mut range_mask)?;
+        core::in_range(
+            &cmax,
+            &Scalar::all(50.0),
+            &Scalar::all(127.0),
+            &mut range_mask,
+        )?;
         core::bitwise_and(&range_mask, &eq_mask, &mut self.out_mask, &core::no_array())?;
 
         let mut diff = Mat::default();
         core::subtract(&cmax, &cmin, &mut diff, &core::no_array(), -1)?;
         let mut inv_cmax = Mat::default();
-        core::subtract(&Scalar::all(255.0), &cmax, &mut inv_cmax, &core::no_array(), -1)?;
+        core::subtract(
+            &Scalar::all(255.0),
+            &cmax,
+            &mut inv_cmax,
+            &core::no_array(),
+            -1,
+        )?;
         let mut inv_div = Mat::default();
         core::divide2(&inv_cmax, &Scalar::all(6.0), &mut inv_div, 1.0, -1)?;
         let mut min_diff = Mat::default();
         core::min(&inv_div, &diff, &mut min_diff)?;
         let mut denom = Mat::default();
-        core::add(&min_diff, &Scalar::all(10.0), &mut denom, &core::no_array(), -1)?;
+        core::add(
+            &min_diff,
+            &Scalar::all(10.0),
+            &mut denom,
+            &core::no_array(),
+            -1,
+        )?;
 
         cmax.set_to(&Scalar::all(255.0), &self.out_mask)?;
         let mut ratio = Mat::default();
@@ -208,7 +252,15 @@ impl MaskCalculator {
         let mut thresh = Mat::default();
         imgproc::threshold(&ratio, &mut thresh, 200.0, 255.0, THRESH_BINARY)?;
         let mut dilated = Mat::default();
-        imgproc::dilate(&thresh, &mut dilated, &self.kernel5, Point::new(-1, -1), 1, BORDER_CONSTANT, Scalar::default())?;
+        imgproc::dilate(
+            &thresh,
+            &mut dilated,
+            &self.kernel5,
+            Point::new(-1, -1),
+            1,
+            BORDER_CONSTANT,
+            Scalar::default(),
+        )?;
         imgproc::morphology_ex(
             &dilated,
             &mut self.out_mask,
@@ -325,13 +377,41 @@ impl CameraOrientationCalculator {
     pub fn predict_rotation(&self, src: &Mat, mask: &Mat) -> Result<(f32, f32), CvError> {
         let mut remap_src = Mat::default();
         let mut remap_mask = Mat::default();
-        imgproc::remap(src, &mut remap_src, &self.remap_x, &self.remap_y, INTER_LINEAR, BORDER_CONSTANT, Scalar::default())?;
-        imgproc::remap(mask, &mut remap_mask, &self.remap_x, &self.remap_y, INTER_NEAREST, BORDER_CONSTANT, Scalar::default())?;
+        imgproc::remap(
+            src,
+            &mut remap_src,
+            &self.remap_x,
+            &self.remap_y,
+            INTER_LINEAR,
+            BORDER_CONSTANT,
+            Scalar::default(),
+        )?;
+        imgproc::remap(
+            mask,
+            &mut remap_mask,
+            &self.remap_x,
+            &self.remap_y,
+            INTER_NEAREST,
+            BORDER_CONSTANT,
+            Scalar::default(),
+        )?;
 
         let mut hls = Mat::default();
         let mut gray = Mat::default();
-        imgproc::cvt_color(&remap_src, &mut hls, COLOR_BGR2HLS_FULL, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
-        imgproc::cvt_color(&remap_src, &mut gray, COLOR_BGR2GRAY, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+        imgproc::cvt_color(
+            &remap_src,
+            &mut hls,
+            COLOR_BGR2HLS_FULL,
+            0,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
+        imgproc::cvt_color(
+            &remap_src,
+            &mut gray,
+            COLOR_BGR2GRAY,
+            0,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
         let mut h_u8 = Mat::default();
         core::extract_channel(&hls, &mut h_u8, 0)?;
 
@@ -363,8 +443,24 @@ impl CameraOrientationCalculator {
 
         let mut hist_a = Mat::default();
         let mut hist_b = Mat::default();
-        imgproc::calc_hist(&imgs_a, &channels, &core::no_array(), &mut hist_a, &hist_size, &ranges, false)?;
-        imgproc::calc_hist(&imgs_b, &channels, &core::no_array(), &mut hist_b, &hist_size, &ranges, false)?;
+        imgproc::calc_hist(
+            &imgs_a,
+            &channels,
+            &core::no_array(),
+            &mut hist_a,
+            &hist_size,
+            &ranges,
+            false,
+        )?;
+        imgproc::calc_hist(
+            &imgs_b,
+            &channels,
+            &core::no_array(),
+            &mut hist_b,
+            &hist_size,
+            &ranges,
+            false,
+        )?;
 
         let h_data = h_img.data_typed::<f32>()?;
         let fa_data = fa_img.data_typed::<f32>()?;
@@ -446,8 +542,8 @@ impl CameraOrientationCalculator {
         if degree < 0.0 {
             degree += 360.0;
         }
-        let confidence =
-            ((max_val + peak_region_sum) / ((PEAK_WIDTH as f64) * (R_LENGTH as f64) * 255.0)) as f32;
+        let confidence = ((max_val + peak_region_sum)
+            / ((PEAK_WIDTH as f64) * (R_LENGTH as f64) * 255.0)) as f32;
         Ok((degree, confidence))
     }
 }
@@ -456,13 +552,27 @@ impl CameraOrientationCalculator {
 pub fn compute_camera_gia_fallback(minimap_bgr: &Mat) -> Result<f32, CvError> {
     let mut gray = Mat::default();
     if minimap_bgr.channels() == 3 {
-        imgproc::cvt_color(minimap_bgr, &mut gray, COLOR_BGR2GRAY, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+        imgproc::cvt_color(
+            minimap_bgr,
+            &mut gray,
+            COLOR_BGR2GRAY,
+            0,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
     } else {
         gray = minimap_bgr.try_clone()?;
     }
 
     let mut blurred = Mat::default();
-    imgproc::gaussian_blur(&gray, &mut blurred, Size::new(3, 3), 0.0, 0.0, BORDER_CONSTANT, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+    imgproc::gaussian_blur(
+        &gray,
+        &mut blurred,
+        Size::new(3, 3),
+        0.0,
+        0.0,
+        BORDER_CONSTANT,
+        core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )?;
 
     let center = Point2f::new(blurred.cols() as f32 / 2.0, blurred.rows() as f32 / 2.0);
     let mut polar = Mat::default();
@@ -511,9 +621,9 @@ pub fn compute_camera_gia_fallback(minimap_bgr: &Mat) -> Result<f32, CvError> {
     let mut result = [0i32; 360];
     for shift in -2i32..=2 {
         let w = 3 - shift.abs();
-        for i in 0..360 {
+        for (i, result_i) in result.iter_mut().enumerate() {
             let si = ((i as i32 - shift).rem_euclid(360)) as usize;
-            result[i] += sum[si] * w / 3;
+            *result_i += sum[si] * w / 3;
         }
     }
 
@@ -592,7 +702,13 @@ pub fn compute_character_orientation(minimap_bgr: &Mat) -> Result<Option<i32>, C
 
     let crop = Mat::roi(minimap_bgr, max_rect)?;
     let mut hsv = Mat::default();
-    imgproc::cvt_color(&crop, &mut hsv, COLOR_BGR2HSV, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+    imgproc::cvt_color(
+        &crop,
+        &mut hsv,
+        COLOR_BGR2HSV,
+        0,
+        core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )?;
     let mut hsv_thresh = Mat::default();
     core::in_range(
         &hsv,
@@ -653,7 +769,10 @@ impl MiniMapPreprocessor {
         })
     }
 
-    pub fn predict_rotation_with_confidence(&mut self, minimap_bgr: &Mat) -> Result<(f32, f32), CvError> {
+    pub fn predict_rotation_with_confidence(
+        &mut self,
+        minimap_bgr: &Mat,
+    ) -> Result<(f32, f32), CvError> {
         let (src, mask) = self.mask_calc.process1(minimap_bgr)?;
         self.co_calc.predict_rotation(&src, &mask)
     }
@@ -668,7 +787,10 @@ impl MiniMapPreprocessor {
         }
     }
 
-    pub fn get_minimap_and_mask(&mut self, minimap_bgr: &Mat) -> Result<(Mat, Mat, f32, f32), CvError> {
+    pub fn get_minimap_and_mask(
+        &mut self,
+        minimap_bgr: &Mat,
+    ) -> Result<(Mat, Mat, f32, f32), CvError> {
         let (src, mask) = self.mask_calc.process1(minimap_bgr)?;
         let (raw_angle, conf) = self.co_calc.predict_rotation(&src, &mask)?;
         let (out_mat, out_mask) = self.mask_calc.process2(raw_angle)?;

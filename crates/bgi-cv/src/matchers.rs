@@ -1,8 +1,10 @@
 use opencv::core::{
-    self, CV_32F, CV_64F, CV_64FC1, CV_8UC1, Mat, MatTraitConst, MatTraitConstManual,
-    NORM_L2SQR, Point, Point2f, Rect, Scalar, Size, Vector,
+    self, CV_8UC1, CV_32F, CV_64F, CV_64FC1, Mat, MatTraitConst, MatTraitConstManual, NORM_L2SQR,
+    Point, Point2f, Rect, Scalar, Size, Vector,
 };
-use opencv::imgproc::{self, TM_CCOEFF, TM_CCOEFF_NORMED, TM_CCORR, TM_CCORR_NORMED, TM_SQDIFF, TM_SQDIFF_NORMED};
+use opencv::imgproc::{
+    self, TM_CCOEFF, TM_CCOEFF_NORMED, TM_CCORR, TM_CCORR_NORMED, TM_SQDIFF, TM_SQDIFF_NORMED,
+};
 use opencv::prelude::MatExprTraitConst;
 
 use crate::CvError;
@@ -59,7 +61,13 @@ pub fn bgra_to_bgr_mat(bgra: &[u8], width: u32, height: u32) -> Result<Mat, CvEr
         )
     }?;
     let mut bgr = Mat::default();
-    imgproc::cvt_color(&src_view, &mut bgr, imgproc::COLOR_BGRA2BGR, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+    imgproc::cvt_color(
+        &src_view,
+        &mut bgr,
+        imgproc::COLOR_BGRA2BGR,
+        0,
+        core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )?;
     Ok(bgr)
 }
 
@@ -161,7 +169,11 @@ impl TemplateMatchNormalizer {
         } else {
             1.0
         };
-        let value = if sign > 0.0 { f64::NEG_INFINITY } else { f64::INFINITY };
+        let value = if sign > 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
         Self {
             mode,
             value,
@@ -196,7 +208,13 @@ impl TemplateMatchNormalizer {
 
 fn sq_diff_match_value(template: &Mat, mask: Option<&Mat>) -> Result<(f64, f64), CvError> {
     let mut inverted = Mat::default();
-    core::subtract(&Scalar::all(255.0), template, &mut inverted, &core::no_array(), -1)?;
+    core::subtract(
+        &Scalar::all(255.0),
+        template,
+        &mut inverted,
+        &core::no_array(),
+        -1,
+    )?;
     let mut worst_mat = Mat::default();
     core::max(template, &inverted, &mut worst_mat)?;
     let worst = match mask {
@@ -218,7 +236,9 @@ fn ccoeff_match_value(template: &Mat, mask: Option<&Mat>) -> Result<(f64, f64), 
     let mut res = Mat::default();
     match mask {
         Some(m) => imgproc::match_template(template, template, &mut res, TM_CCOEFF, m)?,
-        None => imgproc::match_template(template, template, &mut res, TM_CCOEFF, &core::no_array())?,
+        None => {
+            imgproc::match_template(template, template, &mut res, TM_CCOEFF, &core::no_array())?
+        }
     }
     let best = *res.at_2d::<f32>(0, 0)? as f64;
     Ok((best, -best))
@@ -275,7 +295,8 @@ impl FastSqDiffMatcher {
         let mut mask_norm = Mat::default();
         mask.convert_to(&mut mask_norm, CV_32F, 1.0 / 255.0, 0.0)?;
 
-        let mut masked_tpl = Mat::new_size_with_default(template.size()?, template.typ(), Scalar::all(0.0))?;
+        let mut masked_tpl =
+            Mat::new_size_with_default(template.size()?, template.typ(), Scalar::all(0.0))?;
         template.copy_to_masked(&mut masked_tpl, mask)?;
 
         let mut split = Vector::<Mat>::new();
@@ -283,7 +304,10 @@ impl FastSqDiffMatcher {
         Ok((split.into_iter().collect(), mask_norm))
     }
 
-    pub fn get_tpl_sum_sq(masked_templates: &[Mat], channels: Option<&[usize]>) -> Result<f64, CvError> {
+    pub fn get_tpl_sum_sq(
+        masked_templates: &[Mat],
+        channels: Option<&[usize]>,
+    ) -> Result<f64, CvError> {
         let mut sum = 0.0;
         match channels {
             Some(chs) => {
@@ -302,7 +326,11 @@ impl FastSqDiffMatcher {
         Ok(sum)
     }
 
-    pub fn match_global(&self, masked_templates: &[Mat], mask_f: &Mat) -> Result<(Point, f64), CvError> {
+    pub fn match_global(
+        &self,
+        masked_templates: &[Mat],
+        mask_f: &Mat,
+    ) -> Result<(Point, f64), CvError> {
         self.match_slices(&self.source, &self.source_sq, masked_templates, mask_f)
     }
 
@@ -318,7 +346,11 @@ impl FastSqDiffMatcher {
         let mut tpl_views = Vec::with_capacity(masked_templates.len());
 
         let indices: Vec<usize> = match channels {
-            Some(chs) => chs.iter().copied().filter(|&i| i < self.source.len()).collect(),
+            Some(chs) => chs
+                .iter()
+                .copied()
+                .filter(|&i| i < self.source.len())
+                .collect(),
             None => (0..self.source.len()).collect(),
         };
 
@@ -348,9 +380,21 @@ impl FastSqDiffMatcher {
 
         let mut cross_corr = Mat::default();
         let mut temp = Mat::default();
-        imgproc::match_template(&source[0], &masked_templates[0], &mut cross_corr, TM_CCORR, &core::no_array())?;
+        imgproc::match_template(
+            &source[0],
+            &masked_templates[0],
+            &mut cross_corr,
+            TM_CCORR,
+            &core::no_array(),
+        )?;
         for i in 1..n {
-            imgproc::match_template(&source[i], &masked_templates[i], &mut temp, TM_CCORR, &core::no_array())?;
+            imgproc::match_template(
+                &source[i],
+                &masked_templates[i],
+                &mut temp,
+                TM_CCORR,
+                &core::no_array(),
+            )?;
             let mut sum = Mat::default();
             core::add(&cross_corr, &temp, &mut sum, &core::no_array(), -1)?;
             cross_corr = sum;
@@ -385,7 +429,9 @@ impl FastSqDiffMatcher {
 /// 3x3 quadratic subpixel peak/valley fitting mirroring `SubPixMatch.cs`.
 pub fn subpix_fit(src: &Mat, loc: Point) -> Result<Point2f, CvError> {
     if src.empty() || src.cols() < 3 || src.rows() < 3 {
-        return Err(CvError::InvalidImage("SubPixMatch 输入矩阵为空或过小".into()));
+        return Err(CvError::InvalidImage(
+            "SubPixMatch 输入矩阵为空或过小".into(),
+        ));
     }
     if loc.x < 0 || loc.y < 0 || loc.x >= src.cols() || loc.y >= src.rows() {
         return Err(CvError::InvalidImage("SubPixMatch 输入坐标越界".into()));
@@ -417,7 +463,15 @@ pub fn subpix_fit(src: &Mat, loc: Point) -> Result<Point2f, CvError> {
         &FEATURES_DATA[45..54],
     ])?;
     let mut coeff_mat = Mat::zeros(6, 1, CV_64F)?.to_mat()?;
-    core::gemm(&features, &neigh_f64, 1.0, &core::no_array(), 0.0, &mut coeff_mat, 0)?;
+    core::gemm(
+        &features,
+        &neigh_f64,
+        1.0,
+        &core::no_array(),
+        0.0,
+        &mut coeff_mat,
+        0,
+    )?;
 
     let c = coeff_mat.data_typed::<f64>()?;
     let discriminant = c[2] * c[2] - 4.0 * c[0] * c[1];
@@ -478,7 +532,10 @@ mod tests {
 
     #[test]
     fn fast_sq_diff_locates_embedded_patch() {
-        let mut big = Mat::zeros(120, 120, core::CV_8UC3).unwrap().to_mat().unwrap();
+        let mut big = Mat::zeros(120, 120, core::CV_8UC3)
+            .unwrap()
+            .to_mat()
+            .unwrap();
         let mut tpl = Mat::zeros(52, 52, core::CV_8UC3).unwrap().to_mat().unwrap();
         imgproc::rectangle(
             &mut tpl,
@@ -508,11 +565,12 @@ mod tests {
         let bgra = vec![
             11, 22, 33, 255, 44, 55, 66, 128, 77, 88, 99, 0, 10, 20, 30, 200,
         ];
-        let bgr = vec![
-            11, 22, 33, 44, 55, 66, 77, 88, 99, 10, 20, 30,
-        ];
+        let bgr = vec![11, 22, 33, 44, 55, 66, 77, 88, 99, 10, 20, 30];
         let m_from_bgra = frame_to_bgr_mat(&bgra, 2, 2, false).unwrap();
         let m_from_bgr = frame_to_bgr_mat(&bgr, 2, 2, true).unwrap();
-        assert_eq!(m_from_bgra.data_bytes().unwrap(), m_from_bgr.data_bytes().unwrap());
+        assert_eq!(
+            m_from_bgra.data_bytes().unwrap(),
+            m_from_bgr.data_bytes().unwrap()
+        );
     }
 }

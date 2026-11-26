@@ -2,9 +2,9 @@ use std::ptr::{copy_nonoverlapping, null_mut};
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC,
-    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ,
-    ReleaseDC, SRCCOPY, SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, ReleaseDC, SRCCOPY,
+    SelectObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsIconic, IsWindow};
 
@@ -99,7 +99,10 @@ impl BitBltCapturer {
         })
     }
 
-    pub fn capture(&mut self, pool: &FrameBufferPool) -> Result<(u32, u32, PooledBuffer), CaptureError> {
+    pub fn capture(
+        &mut self,
+        pool: &FrameBufferPool,
+    ) -> Result<(u32, u32, PooledBuffer), CaptureError> {
         if unsafe { !IsWindow(Some(self.hwnd)).as_bool() } {
             return Err(CaptureError::InvalidWindow);
         }

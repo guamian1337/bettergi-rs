@@ -10,6 +10,7 @@ opencv411 = ["dep:opencv"]
 
 [dependencies]
 opencv = { workspace = true, optional = true }
+bgi-task = { path = "../bgi-task" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
