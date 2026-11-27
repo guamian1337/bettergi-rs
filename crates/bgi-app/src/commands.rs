@@ -694,7 +694,7 @@ fn stop_active_pathing(
     }
 }
 
-async fn stop_and_join_active_pathing(
+pub(crate) async fn stop_and_join_active_pathing(
     snapshot: &mut UiSnapshot,
     active_pathing: &mut Option<ActiveTask>,
     core: &CoreEndpoint,
@@ -3263,6 +3263,14 @@ pub(crate) async fn handle_command(
             core.emit_log(LogLevel::Info, "Core", "正在关闭后台核心...");
             Ok(())
         }
+        // 配置组命令由 core 主循环在调用本函数前拦截处理（需要持有 GroupRunner）。
+        CoreCommand::RefreshScriptGroups
+        | CoreCommand::StartScriptGroup { .. }
+        | CoreCommand::StopScriptGroup
+        | CoreCommand::CreateScriptGroup { .. }
+        | CoreCommand::DeleteScriptGroup { .. }
+        | CoreCommand::AddScriptGroupProject { .. }
+        | CoreCommand::RemoveScriptGroupProject { .. } => Ok(()),
     }
 }
 

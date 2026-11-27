@@ -595,6 +595,38 @@ pub struct TriggerLeaseStatus {
     pub options: serde_json::Value,
 }
 
+/// 配置组摘要（对应 C# `ScriptGroup` 的 UI 展示字段）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScriptGroupSummary {
+    pub name: String,
+    pub index: i32,
+    pub project_count: usize,
+    pub enabled_count: usize,
+    /// 项目明细（序号 / 名称 / 类型 / 是否启用），供 UI 展示与删除。
+    #[serde(default)]
+    pub projects: Vec<ScriptGroupProjectSummary>,
+}
+
+/// 配置组项目摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScriptGroupProjectSummary {
+    pub index: i32,
+    pub name: String,
+    pub project_type: String,
+    pub folder_name: String,
+    pub enabled: bool,
+}
+
+/// 配置组当前执行进度。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScriptGroupProgress {
+    pub group_name: String,
+    pub project_name: String,
+    pub project_index: usize,
+    pub project_total: usize,
+    pub run_num: i32,
+}
+
 /// Read-only state snapshot published by `bgi-core` via `watch`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct UiSnapshot {
@@ -622,6 +654,10 @@ pub struct UiSnapshot {
     pub last_task_report: Option<TaskReport>,
     #[serde(default)]
     pub last_salvage_preview_report: Option<SalvagePreviewReport>,
+    #[serde(default)]
+    pub script_groups: Vec<ScriptGroupSummary>,
+    #[serde(default)]
+    pub script_group_progress: Option<ScriptGroupProgress>,
 }
 
 /// Separate image data plane (`ArcSwap` single-slot, newest frame wins).
@@ -696,7 +732,9 @@ pub enum CoreEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoreCommand {
     RefreshWindows,
-    SelectWindow { hwnd: Option<isize> },
+    SelectWindow {
+        hwnd: Option<isize>,
+    },
     SetCaptureMode(CaptureMode),
     SetPreviewEnabled(bool),
     SetCaptureNoRender(bool),
@@ -719,7 +757,9 @@ pub enum CoreCommand {
     SetTaskLimits(TaskLimitsConfig),
     SetAssetsDir(String),
     RefreshPaths,
-    SelectPath { file_path: String },
+    SelectPath {
+        file_path: String,
+    },
     ProbeMiniMapCv,
     ProbeBigMapSift,
     ProbeOcrScreen,
@@ -732,17 +772,52 @@ pub enum CoreCommand {
     StartMining,
     BeginHotkeyCapture(Option<HotkeyAction>),
     UpdateHotkey(HotkeyBinding),
-    TestInputKey { vk: u16 },
+    TestInputKey {
+        vk: u16,
+    },
     StartBasicPathing,
     StartAutoCook,
     ClaimCurrentPageRewards,
     ClaimVisiblePageRewards,
     OpenCurrentChest,
-    StartAutoWood { verify_gain: bool },
+    StartAutoWood {
+        verify_gain: bool,
+    },
     StartOneKeyExpedition,
     StartArtifactSalvagePreview,
-    StartFishing { dry_run: bool },
+    StartFishing {
+        dry_run: bool,
+    },
     SetFishingDryRun(bool),
+    /// 配置组：刷新列表（从 User/ScriptGroup 重新加载）。
+    RefreshScriptGroups,
+    /// 配置组：按名称启动，可选从断点项目索引开始。
+    StartScriptGroup {
+        name: String,
+        from_index: Option<i32>,
+    },
+    /// 配置组：停止并保留断点。
+    StopScriptGroup,
+    /// 配置组：新建空组。
+    CreateScriptGroup {
+        name: String,
+    },
+    /// 配置组：删除组（同时删除其 JSON 文件）。
+    DeleteScriptGroup {
+        name: String,
+    },
+    /// 配置组：新增一个项目。
+    AddScriptGroupProject {
+        group: String,
+        project_type: String,
+        folder_name: String,
+        name: String,
+    },
+    /// 配置组：删除一个项目（按索引）。
+    RemoveScriptGroupProject {
+        group: String,
+        index: i32,
+    },
     StopPathing,
     OpenLogDir,
     EmergencyStop,

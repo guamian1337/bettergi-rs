@@ -12,9 +12,10 @@ use bgi_input::{RawInputHub, RawInputSignal};
 use tokio::sync::mpsc;
 
 use crate::capture_host::{ActiveCapturer, CapturePaceState, capture_frame, release_idle_capturer};
-use crate::commands::{handle_command, handle_raw_signal};
+use crate::commands::{handle_command, handle_raw_signal, stop_and_join_active_pathing};
 use crate::cv_service::CvOcrServices;
 use crate::pathing_host::PathingEvent;
+use crate::script_group::{GroupRunner, Step};
 use crate::task_runtime::{ActiveTask, accepts_event};
 use crate::trigger_runtime::{AutoPickExecutionContext, TriggerRuntime};
 use bgi_task::{
@@ -230,6 +231,16 @@ async fn run_core_loop(
     let mut last_ui_classification = tokio::time::Instant::now() - Duration::from_secs(1);
     let mut pending_auto_pick: Option<PendingAutoPick> = None;
 
+    // 配置组执行器：User 目录与 config_store 一致（exe 父目录/User）。
+    let user_dir = persisted_config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let mut group_runner = GroupRunner::new(&user_dir);
+    // 当前正在执行的路径任务是否属于配置组（避免与手动寻路的 Finished 混淆）。
+    let mut group_task_id: Option<u64> = None;
+    snapshot.script_groups = group_runner.summaries();
+
     loop {
         if active_pathing.is_none()
             && !snapshot.task_state.is_task_active()
@@ -292,6 +303,151 @@ async fn run_core_loop(
                 let was_preview = snapshot.preview_enabled;
                 let is_shutdown = matches!(env.cmd, CoreCommand::ShutdownCore);
                 let previous_config = snapshot.config.clone();
+
+                // 配置组命令由本层处理：需要持有 GroupRunner 并驱动 Step 状态机。
+                let group_cmd = match &env.cmd {
+                    CoreCommand::RefreshScriptGroups => Some("refresh".to_string()),
+                    CoreCommand::StartScriptGroup { name, from_index } => {
+                        Some(format!("start:{name}:{}", from_index.unwrap_or(-1)))
+                    }
+                    CoreCommand::StopScriptGroup => Some("stop".to_string()),
+                    CoreCommand::CreateScriptGroup { name } => Some(format!("create:{name}")),
+                    CoreCommand::DeleteScriptGroup { name } => Some(format!("delete:{name}")),
+                    CoreCommand::AddScriptGroupProject { group, name, .. } => {
+                        Some(format!("add:{group}/{name}"))
+                    }
+                    CoreCommand::RemoveScriptGroupProject { group, index } => {
+                        Some(format!("remove:{group}/{index}"))
+                    }
+                    _ => None,
+                };
+                if let Some(action) = group_cmd {
+                    let result = match &env.cmd {
+                        CoreCommand::RefreshScriptGroups => group_runner
+                            .reload()
+                            .map(|_| {
+                                snapshot.script_groups = group_runner.summaries();
+                                core.emit_log(
+                                    LogLevel::Info,
+                                    "ScriptGroup",
+                                    format!("已刷新 {} 个配置组", snapshot.script_groups.len()),
+                                );
+                            })
+                            .map_err(|e| e.to_string()),
+                        CoreCommand::StopScriptGroup => {
+                            group_runner.stop();
+                            group_task_id = None;
+                            snapshot.script_group_progress = None;
+                            // 若当前路径任务属于配置组，一并停止。
+                            if active_pathing.is_some() {
+                                stop_and_join_active_pathing(
+                                    &mut snapshot,
+                                    &mut active_pathing,
+                                    &core,
+                                    "配置组已停止",
+                                )
+                                .await
+                                .ok();
+                                trigger_runtime.set_task_mode(false);
+                            }
+                            core.emit_log(LogLevel::Info, "ScriptGroup", "已停止配置组");
+                            Ok(())
+                        }
+                        CoreCommand::StartScriptGroup { name, from_index } => {
+                            if active_pathing.is_some() || snapshot.task_state.is_task_active() {
+                                Err("已有任务在执行，无法启动配置组".to_string())
+                            } else {
+                                group_runner.set_pathing_root(resolve_pathing_root(&snapshot));
+                                match group_runner.start(name, *from_index) {
+                                    Ok(step) => {
+                                        snapshot.script_group_progress = group_runner.progress();
+                                        advance_group_step(
+                                            step,
+                                            &mut group_runner,
+                                            &mut snapshot,
+                                            &raw_hub,
+                                            &capturer,
+                                            &pool,
+                                            &mut frame_seq,
+                                            &mut dbg_seq,
+                                            &mut pace,
+                                            &cv_ocr,
+                                            &mut trigger_runtime,
+                                            &mut active_pathing,
+                                            &mut next_task_id,
+                                            &pathing_tx,
+                                            &core,
+                                            &mut group_task_id,
+                                        )
+                                        .await
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                        }
+                        CoreCommand::CreateScriptGroup { name } => {
+                            group_runner
+                                .create_group(name)
+                                .map(|_| {
+                                    snapshot.script_groups = group_runner.summaries();
+                                    core.emit_log(
+                                        LogLevel::Info,
+                                        "ScriptGroup",
+                                        format!("已新建配置组「{name}」"),
+                                    );
+                                })
+                                .map_err(|e| e.to_string())
+                        }
+                        CoreCommand::DeleteScriptGroup { name } => {
+                            group_runner
+                                .delete_group(name)
+                                .map(|_| {
+                                    snapshot.script_groups = group_runner.summaries();
+                                    core.emit_log(
+                                        LogLevel::Info,
+                                        "ScriptGroup",
+                                        format!("已删除配置组「{name}」"),
+                                    );
+                                })
+                                .map_err(|e| e.to_string())
+                        }
+                        CoreCommand::AddScriptGroupProject {
+                            group,
+                            project_type,
+                            folder_name,
+                            name,
+                        } => group_runner
+                            .add_project(group, project_type, folder_name, name)
+                            .map(|_| {
+                                snapshot.script_groups = group_runner.summaries();
+                                core.emit_log(
+                                    LogLevel::Info,
+                                    "ScriptGroup",
+                                    format!("已往「{group}」添加项目「{name}」（{project_type}）"),
+                                );
+                            })
+                            .map_err(|e| e.to_string()),
+                        CoreCommand::RemoveScriptGroupProject { group, index } => group_runner
+                            .remove_project(group, *index)
+                            .map(|_| {
+                                snapshot.script_groups = group_runner.summaries();
+                                core.emit_log(
+                                    LogLevel::Info,
+                                    "ScriptGroup",
+                                    format!("已从「{group}」删除项目序号 {index}"),
+                                );
+                            })
+                            .map_err(|e| e.to_string()),
+                        _ => Ok(()),
+                    };
+                    if let Err(ref err) = result {
+                        core.emit_log(LogLevel::Warn, "ScriptGroup", format!("{action} 失败: {err}"));
+                    }
+                    let _ = env.reply.send(result);
+                    core.publish_snapshot(Arc::new(snapshot.clone()));
+                    continue;
+                }
+
                 let mut result = handle_command(
                     env.cmd,
                     &mut snapshot,
@@ -431,6 +587,9 @@ async fn run_core_loop(
                         {
                             let _ = join.join();
                         }
+                        // 判断是否是配置组驱动的任务，决定成功后是否推进下一项目。
+                        let is_group_task = group_task_id == Some(task_id);
+                        let group_success = matches!(&result, Ok(report) if matches!(report.outcome, TaskOutcome::Success | TaskOutcome::Partial));
                         match result {
                             Ok(report) => {
                                 let outcome = report.outcome;
@@ -469,6 +628,28 @@ async fn run_core_loop(
                         {
                             let mut cap_guard = capturer.lock().unwrap();
                             release_idle_capturer(&snapshot, &mut cap_guard, &core);
+                        }
+                        // 配置组：写执行记录并推进下一项。失败或非组任务则结束组。
+                        if is_group_task {
+                            if !group_success || stopping {
+                                group_runner.stop();
+                                group_task_id = None;
+                                snapshot.script_group_progress = None;
+                                core.emit_log(LogLevel::Warn, "ScriptGroup", "配置组因当前项目失败/停止而终止");
+                            } else if let Ok(step) = group_runner.on_finished(true) {
+                                let advance = advance_group_step(
+                                    step, &mut group_runner, &mut snapshot, &raw_hub, &capturer,
+                                    &pool, &mut frame_seq, &mut dbg_seq, &mut pace, &cv_ocr,
+                                    &mut trigger_runtime, &mut active_pathing, &mut next_task_id,
+                                    &pathing_tx, &core, &mut group_task_id,
+                                ).await;
+                                if let Err(error) = advance {
+                                    core.emit_log(LogLevel::Warn, "ScriptGroup", format!("推进配置组失败: {error}"));
+                                    group_runner.stop();
+                                    group_task_id = None;
+                                    snapshot.script_group_progress = None;
+                                }
+                            }
                         }
                         core.publish_snapshot(Arc::new(snapshot.clone()));
                     }
@@ -745,4 +926,151 @@ async fn run_core_loop(
     }
     drop(raw_hub);
     bgi_input::release_all_keys();
+}
+
+/// 解析配置组 Pathing 项目使用的路径根目录。
+fn resolve_pathing_root(snapshot: &UiSnapshot) -> String {
+    if !snapshot.config.pathing_dir.is_empty() {
+        return snapshot.config.pathing_dir.clone();
+    }
+    r"d:/bgiprro/better-genshin-impact/BetterGenshinImpact/User/AutoPathing".to_string()
+}
+
+/// 推进配置组的一步：RunPath 时启动路径任务；Unsupported/Done 时记日志并自动推进。
+#[allow(clippy::too_many_arguments)]
+async fn advance_group_step(
+    mut step: Step,
+    group_runner: &mut GroupRunner,
+    snapshot: &mut UiSnapshot,
+    raw_hub: &Option<bgi_input::RawInputHub>,
+    capturer: &Arc<Mutex<ActiveCapturer>>,
+    pool: &Arc<FrameBufferPool>,
+    frame_seq: &mut u64,
+    dbg_seq: &mut u64,
+    pace: &mut CapturePaceState,
+    cv_ocr: &Arc<Mutex<CvOcrServices>>,
+    trigger_runtime: &mut TriggerRuntime,
+    active_pathing: &mut Option<ActiveTask>,
+    next_task_id: &mut u64,
+    pathing_tx: &mpsc::UnboundedSender<PathingEvent>,
+    core: &CoreEndpoint,
+    group_task_id: &mut Option<u64>,
+) -> Result<(), String> {
+    // 非 Pathing 项目：记录日志后自动推进，不占用任务槽。
+    loop {
+        match step {
+            Step::Unsupported { project_type } => {
+                core.emit_log(
+                    LogLevel::Warn,
+                    "ScriptGroup",
+                    format!("项目类型 {project_type} 一期暂不支持，跳过该项"),
+                );
+                step = group_runner.on_finished(false).unwrap_or(Step::Done);
+            }
+            Step::RunScript {
+                project_dir,
+                main,
+                settings,
+            } => {
+                use crate::script_host::CoreHostKernel;
+                use bgi_script::{Engine, QuickJsEngine};
+
+                let script_run = bgi_script::ScriptRun {
+                    project_dir: project_dir.clone(),
+                    main: main.clone(),
+                    settings: match settings {
+                        serde_json::Value::Object(map) => {
+                            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                        }
+                        _ => std::collections::BTreeMap::new(),
+                    },
+                    cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    allowed_methods: Vec::new(),
+                };
+                let cancel = script_run.cancel.clone();
+                let kernel = std::sync::Arc::new(CoreHostKernel::new(
+                    core.log_publisher(),
+                    project_dir.clone(),
+                    cancel.clone(),
+                ));
+                core.emit_log(
+                    LogLevel::Info,
+                    "ScriptGroup",
+                    format!("执行 JS 脚本「{}」", project_dir.display()),
+                );
+                let started = std::time::Instant::now();
+                let result = QuickJsEngine.run(&script_run, kernel).await;
+                let elapsed_ms = started.elapsed().as_millis();
+                let success = match &result {
+                    Ok(outcome) => outcome.completed && outcome.error.is_none(),
+                    Err(_) => false,
+                };
+                match &result {
+                    Ok(outcome) => {
+                        if let Some(error) = &outcome.error {
+                            core.emit_log(
+                                LogLevel::Warn,
+                                "ScriptGroup",
+                                format!("JS 脚本异常: {error}（{elapsed_ms}ms）"),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        core.emit_log(
+                            LogLevel::Warn,
+                            "ScriptGroup",
+                            format!("JS 脚本失败: {error}（{elapsed_ms}ms）"),
+                        );
+                    }
+                }
+                // 脚本不占用 ActiveTask 槽，但需要能被 StopScriptGroup 取消：
+                // 这里只记录进度，取消由 group_runner.stop() + 后续项目的 is_cancelled 检查实现。
+                let _ = cancel;
+                step = group_runner.on_finished(success).unwrap_or(Step::Done);
+            }
+            Step::Done => {
+                let group_name = group_runner.current_group_name().to_string();
+                group_runner.stop();
+                snapshot.script_group_progress = None;
+                *group_task_id = None;
+                core.emit_log(
+                    LogLevel::Info,
+                    "ScriptGroup",
+                    format!("配置组「{group_name}」执行结束"),
+                );
+                return Ok(());
+            }
+            Step::RunPath(path) => {
+                // 记录即将启动的任务 id，供 Finished 分支识别。
+                let requested_id = *next_task_id;
+                let previous_file = snapshot.active_path_file.clone();
+                snapshot.active_path_file = Some(path.clone());
+                let result = handle_command(
+                    CoreCommand::StartBasicPathing,
+                    snapshot,
+                    raw_hub,
+                    capturer,
+                    pool,
+                    frame_seq,
+                    dbg_seq,
+                    pace,
+                    cv_ocr,
+                    trigger_runtime,
+                    active_pathing,
+                    next_task_id,
+                    pathing_tx,
+                    core,
+                )
+                .await;
+                snapshot.active_path_file = previous_file;
+                if let Err(error) = result {
+                    snapshot.active_path_file = Some(path);
+                    return Err(error);
+                }
+                *group_task_id = Some(requested_id);
+                snapshot.script_group_progress = group_runner.progress();
+                return Ok(());
+            }
+        }
+    }
 }

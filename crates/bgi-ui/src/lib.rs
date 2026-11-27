@@ -16,6 +16,7 @@ const MAX_RAW_KEY_HISTORY: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavTab {
     Pathing,
+    ScriptGroup,
     Capture,
     CvDebug,
     Input,
@@ -57,6 +58,13 @@ pub struct BgiAppUi {
     task_limits_draft: TaskLimitsConfig,
     fishing_dry_run_draft: bool,
     auto_wood_verify_gain: bool,
+    selected_script_group: String,
+    script_group_from_index: String,
+    new_group_name: String,
+    new_project_name: String,
+    new_project_folder: String,
+    new_project_type: String,
+    remove_project_index: String,
     assets_dir_draft: String,
     preferred_proc_draft: String,
     fps_draft: i32,
@@ -99,6 +107,13 @@ impl BgiAppUi {
             task_limits_draft: TaskLimitsConfig::default(),
             fishing_dry_run_draft: true,
             auto_wood_verify_gain: false,
+            selected_script_group: String::new(),
+            script_group_from_index: String::new(),
+            new_group_name: String::new(),
+            new_project_name: String::new(),
+            new_project_folder: String::new(),
+            new_project_type: "Pathing".to_string(),
+            remove_project_index: String::new(),
             assets_dir_draft: String::new(),
             preferred_proc_draft: String::new(),
             fps_draft: 10,
@@ -259,6 +274,7 @@ impl BgiAppUi {
                 ui.add_space(6.0);
                 let tabs = [
                     (NavTab::Pathing, "基础寻路"),
+                    (NavTab::ScriptGroup, "配置组"),
                     (NavTab::Capture, "抓图预览"),
                     (NavTab::CvDebug, "视觉与 OCR"),
                     (NavTab::Input, "热键与输入"),
@@ -296,6 +312,7 @@ impl BgiAppUi {
 
         egui::CentralPanel::default().show(ui, |ui| match self.active_tab {
             NavTab::Pathing => self.render_pathing_tab(ui, client, &snapshot),
+            NavTab::ScriptGroup => self.render_script_group_tab(ui, client, &snapshot),
             NavTab::Capture => self.render_capture_tab(ui, client, &snapshot),
             NavTab::CvDebug => self.render_cv_debug_tab(ui, client, &snapshot),
             NavTab::Input => self.render_input_tab(ui, client, &snapshot),
@@ -405,6 +422,208 @@ impl BgiAppUi {
             Ok(rx) => self.pending_replies.push((label.to_string(), rx)),
             Err(e) => self.status_toast = Some((format!("{label}: {e}"), true)),
         }
+    }
+
+    /// 配置组页：列出 User/ScriptGroup 下的组，支持刷新/启动/停止与断点续跑。
+    fn render_script_group_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        client: &ControlClient,
+        snapshot: &UiSnapshot,
+    ) {
+        ui.heading("配置组（ScriptGroup）");
+        ui.label("读取 User/ScriptGroup/*.json，与 C# 原版配置组兼容。一期仅 Pathing 项目可执行，JS/键鼠/Shell 项目会被识别并跳过。");
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            if ui.button("刷新配置组").clicked() {
+                self.send_cmd(client, "刷新配置组", CoreCommand::RefreshScriptGroups);
+            }
+            ui.label(format!("共 {} 个组", snapshot.script_groups.len()));
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("新建组：");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_group_name)
+                    .desired_width(160.0)
+                    .hint_text("组名"),
+            );
+            if ui.button("创建").clicked() {
+                let name = self.new_group_name.trim().to_string();
+                if !name.is_empty() {
+                    self.send_cmd(
+                        client,
+                        "新建配置组",
+                        CoreCommand::CreateScriptGroup { name },
+                    );
+                    self.new_group_name.clear();
+                }
+            }
+            if !self.selected_script_group.is_empty() && ui.button("删除选中组").clicked() {
+                self.send_cmd(
+                    client,
+                    "删除配置组",
+                    CoreCommand::DeleteScriptGroup {
+                        name: self.selected_script_group.clone(),
+                    },
+                );
+                self.selected_script_group.clear();
+            }
+        });
+
+        if let Some(progress) = &snapshot.script_group_progress {
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "执行中：{} → {}（{}/{}，第 {} 轮）",
+                    progress.group_name,
+                    progress.project_name,
+                    progress.project_index,
+                    progress.project_total,
+                    progress.run_num
+                ))
+                .color(Color32::from_rgb(200, 120, 30)),
+            );
+            if ui.button("停止配置组").clicked() {
+                self.send_cmd(client, "停止配置组", CoreCommand::StopScriptGroup);
+            }
+        }
+
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for group in &snapshot.script_groups {
+                let selected = self.selected_script_group == group.name;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::selectable(selected, &group.name))
+                        .clicked()
+                    {
+                        self.selected_script_group = group.name.clone();
+                    }
+                    ui.label(format!(
+                        "序号 {} · {} 个项目（{} 启用）",
+                        group.index, group.project_count, group.enabled_count
+                    ));
+                });
+            }
+
+            if !self.selected_script_group.is_empty() {
+                ui.separator();
+                let selected_name = self.selected_script_group.clone();
+                if let Some(group) = snapshot
+                    .script_groups
+                    .iter()
+                    .find(|g| g.name == selected_name)
+                {
+                    ui.label(format!("「{}」的项目：", group.name));
+                    for project in &group.projects {
+                        ui.label(format!(
+                            "  [{}] {} · {} · {}{}",
+                            project.index,
+                            project.name,
+                            project.project_type,
+                            if project.folder_name.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", project.folder_name)
+                            },
+                            if project.enabled { "" } else { " [禁用]" }
+                        ));
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("从项目序号开始（断点续跑，留空=从头）：");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.script_group_from_index)
+                            .desired_width(80.0)
+                            .hint_text("如 3"),
+                    );
+                });
+                let from_index = self.script_group_from_index.trim().parse::<i32>().ok();
+                let name = self.selected_script_group.clone();
+                ui.horizontal(|ui| {
+                    if ui.button("启动配置组").clicked() {
+                        self.send_cmd(
+                            client,
+                            "启动配置组",
+                            CoreCommand::StartScriptGroup { name, from_index },
+                        );
+                    }
+                    if ui.button("从此项开始").clicked()
+                        && let Some(idx) = from_index
+                    {
+                        self.send_cmd(
+                            client,
+                            "从此项开始",
+                            CoreCommand::StartScriptGroup {
+                                name: self.selected_script_group.clone(),
+                                from_index: Some(idx),
+                            },
+                        );
+                    }
+                });
+
+                ui.separator();
+                ui.label("添加项目（类型：Javascript / KeyMouse / Pathing / Shell）：");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_project_type)
+                            .desired_width(100.0)
+                            .hint_text("类型"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_project_folder)
+                            .desired_width(140.0)
+                            .hint_text("文件夹名"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_project_name)
+                            .desired_width(140.0)
+                            .hint_text("项目名/文件名"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("添加项目").clicked() {
+                        let pname = self.new_project_name.trim().to_string();
+                        if !pname.is_empty() {
+                            self.send_cmd(
+                                client,
+                                "添加项目",
+                                CoreCommand::AddScriptGroupProject {
+                                    group: self.selected_script_group.clone(),
+                                    project_type: self.new_project_type.trim().to_string(),
+                                    folder_name: self.new_project_folder.trim().to_string(),
+                                    name: pname,
+                                },
+                            );
+                            self.new_project_name.clear();
+                        }
+                    }
+                    ui.label("删除项目序号：");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.remove_project_index)
+                            .desired_width(50.0)
+                            .hint_text("序号"),
+                    );
+                    if ui.button("删除项目").clicked()
+                        && let Some(idx) = self.remove_project_index.trim().parse::<i32>().ok()
+                    {
+                        self.send_cmd(
+                            client,
+                            "删除项目",
+                            CoreCommand::RemoveScriptGroupProject {
+                                group: self.selected_script_group.clone(),
+                                index: idx,
+                            },
+                        );
+                        self.remove_project_index.clear();
+                    }
+                });
+                ui.label("提示：Pathing 项目的「文件夹名/项目名」对应路径脚本的相对目录与文件名。");
+            }
+        });
     }
 
     fn render_pathing_tab(

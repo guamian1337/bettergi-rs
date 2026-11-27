@@ -7,6 +7,7 @@ mod fishing_host;
 mod logging;
 mod mining_host;
 mod pathing_host;
+mod script_group;
 mod task_runtime;
 mod tray;
 mod trigger_runtime;
@@ -145,3 +146,4 @@ fn main() {
     let _ = dispatcher.try_send(CoreCommand::ShutdownCore);
     core_handle.join();
 }
+mod script_host;
