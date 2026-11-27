@@ -161,6 +161,10 @@ pub trait PathingHost {
     fn capture_cooking_bar(&mut self) -> Result<Option<CookingObservation>, String> {
         Err("烹饪条识别未实现".into())
     }
+    /// 莉奈娅挖矿动作：参数形如 `"3"`、`"3,10"`、`"mines=3,rounds=10"`。
+    fn run_linnea_mining(&mut self, _params: Option<&str>) -> Result<(), String> {
+        Err("莉奈娅挖矿动作需要采矿运行时，当前 host 未接入".into())
+    }
     fn release_all_keys(&mut self);
     fn on_progress(&mut self, current_index: usize, total_points: usize);
     fn on_checkpoint(&mut self, _checkpoint: &PathingCheckpoint) {}
@@ -858,6 +862,16 @@ impl PathExecutor {
                 host.key_tap(VK_Z, 50);
                 host.sleep_ms(250);
             }
+            Some("linnea_mining") => {
+                host.on_log(
+                    LogLevel::Info,
+                    format!(
+                        "[{idx1}/{total}] 莉奈娅挖矿（参数 {}）",
+                        wp.action_params.as_deref().unwrap_or("默认")
+                    ),
+                );
+                host.run_linnea_mining(wp.action_params.as_deref())?;
+            }
             _ => {}
         }
 
@@ -1454,6 +1468,46 @@ pub(crate) mod tests {
         fn on_log(&mut self, _: LogLevel, msg: String) {
             self.events.push(msg);
         }
+        fn run_linnea_mining(&mut self, params: Option<&str>) -> Result<(), String> {
+            self.events
+                .push(format!("linnea_mining:{}", params.unwrap_or("")));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mock_path_executor_runs_linnea_mining_action() {
+        let task = PathingTaskFile {
+            info: PathingInfo {
+                name: "MiningAction".into(),
+                ..Default::default()
+            },
+            positions: vec![Waypoint {
+                x: 0.0,
+                y: 0.0,
+                waypoint_type: "path".into(),
+                move_mode: "walk".into(),
+                action: Some("linnea_mining".into()),
+                action_params: Some("mines=2,rounds=3".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut host = MockHost::new((0.0, 0.0));
+        PathExecutor::run(&mut host, "MiningAction", &task).unwrap();
+        assert!(
+            host.events
+                .iter()
+                .any(|event| event == "linnea_mining:mines=2,rounds=3"),
+            "{:?}",
+            host.events
+        );
+        assert!(
+            !host.events.iter().any(|event| event.contains("暂未实现")),
+            "linnea_mining 已支持，不应再报未实现: {:?}",
+            host.events
+        );
     }
 
     #[test]

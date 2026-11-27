@@ -40,7 +40,9 @@ impl CookingBarConfig {
         }
         Ok(Self {
             minimum_count: self.minimum_count * scale,
-            tolerance: self.tolerance * scale,
+            // C# scales only `peakMinCount` and `triggerDropCount` (`AutoCookTask.cs:34-35`)
+            // and compares the tolerance unscaled (`:129`), so this must not follow `scale`.
+            tolerance: self.tolerance,
             stable_frames: self.stable_frames,
             drop_count: self.drop_count * scale,
         })

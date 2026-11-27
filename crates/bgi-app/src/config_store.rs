@@ -159,4 +159,28 @@ mod tests {
         );
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn legacy_limits_without_mining_fields_fall_back_to_defaults() {
+        let dir = test_dir("legacy_mining");
+        let path = dir.join("core_config.json");
+        let mut value = serde_json::to_value(CoreConfig::default()).unwrap();
+        let limits = value
+            .get_mut("task_limits")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        limits.remove("mining_max_shots");
+        limits.remove("mining_total_timeout_ms");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let defaults = bgi_control::TaskLimitsConfig::default();
+        let loaded = load_config(&path).unwrap().task_limits;
+        assert_eq!(loaded.mining_max_shots, defaults.mining_max_shots);
+        assert_eq!(
+            loaded.mining_total_timeout_ms,
+            defaults.mining_total_timeout_ms
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

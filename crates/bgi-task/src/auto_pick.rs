@@ -136,7 +136,9 @@ impl AutoPickDecision {
     }
 }
 
-pub const AUTO_PICK_REQUIRED_STABLE_SAMPLES: usize = 2;
+// C# `AutoPickTrigger` presses the pick key on the first frame that matches, with no
+// stability window (`:301-323`), so a single sample is the equivalent behaviour.
+pub const AUTO_PICK_REQUIRED_STABLE_SAMPLES: usize = 1;
 pub const AUTO_PICK_MAX_OBSERVATION_AGE: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -773,55 +775,36 @@ mod tests {
     }
 
     #[test]
-    fn prompt_gate_requires_stable_positive_observations() {
+    fn prompt_gate_readies_on_the_first_positive_observation() {
         let mut gate = AutoPickPromptGate::default();
         let now = Instant::now();
         assert_eq!(gate.observe(None, now), AutoPickGateState::Idle);
-        assert_eq!(gate.observe(Some(7), now), AutoPickGateState::Idle);
-        assert_eq!(gate.observe(Some(8), now), AutoPickGateState::Idle);
-        assert_eq!(
-            gate.observe(Some(8), now + Duration::from_millis(100)),
-            AutoPickGateState::Ready(8)
-        );
+        // C# acts on the first matching frame, so no second sample is required.
+        assert_eq!(gate.observe(Some(7), now), AutoPickGateState::Ready(7));
     }
 
     #[test]
-    fn prompt_gate_services_each_stable_prompt_at_most_once() {
+    fn prompt_gate_services_each_prompt_at_most_once() {
         let mut gate = AutoPickPromptGate::default();
         let now = Instant::now();
-        gate.observe(Some(7), now);
-        assert_eq!(
-            gate.observe(Some(7), now + Duration::from_millis(100)),
-            AutoPickGateState::Ready(7)
-        );
+        assert_eq!(gate.observe(Some(7), now), AutoPickGateState::Ready(7));
         gate.mark_serviced(7);
         assert_eq!(
-            gate.observe(Some(7), now + Duration::from_millis(200)),
+            gate.observe(Some(7), now + Duration::from_millis(100)),
             AutoPickGateState::Serviced(7)
         );
         assert_eq!(
-            gate.observe(None, now + Duration::from_millis(300)),
+            gate.observe(None, now + Duration::from_millis(200)),
             AutoPickGateState::Idle
         );
+        // Clearing the prompt does not un-service an identity.
         assert_eq!(
-            gate.observe(None, now + Duration::from_millis(400)),
-            AutoPickGateState::Idle
-        );
-        assert_eq!(
-            gate.observe(Some(7), now + Duration::from_millis(500)),
-            AutoPickGateState::Serviced(7)
-        );
-        assert_eq!(
-            gate.observe(Some(7), now + Duration::from_millis(600)),
+            gate.observe(Some(7), now + Duration::from_millis(300)),
             AutoPickGateState::Serviced(7)
         );
         gate.reset();
         assert_eq!(
-            gate.observe(Some(7), now + Duration::from_millis(700)),
-            AutoPickGateState::Idle
-        );
-        assert_eq!(
-            gate.observe(Some(7), now + Duration::from_millis(800)),
+            gate.observe(Some(7), now + Duration::from_millis(400)),
             AutoPickGateState::Ready(7)
         );
     }
@@ -830,11 +813,12 @@ mod tests {
     fn servicing_another_prompt_does_not_rearm_an_earlier_identity() {
         let mut gate = AutoPickPromptGate::default();
         let now = Instant::now();
-        gate.observe(Some(7), now);
-        gate.observe(Some(7), now + Duration::from_millis(100));
+        assert_eq!(gate.observe(Some(7), now), AutoPickGateState::Ready(7));
         gate.mark_serviced(7);
-        gate.observe(Some(8), now + Duration::from_millis(200));
-        gate.observe(Some(8), now + Duration::from_millis(300));
+        assert_eq!(
+            gate.observe(Some(8), now + Duration::from_millis(200)),
+            AutoPickGateState::Ready(8)
+        );
         gate.mark_serviced(8);
         assert_eq!(
             gate.observe(Some(7), now + Duration::from_millis(400)),
@@ -843,44 +827,32 @@ mod tests {
     }
 
     #[test]
-    fn missing_observation_breaks_consecutive_stability() {
+    fn stale_gap_does_not_block_a_single_frame_hit() {
         let mut gate = AutoPickPromptGate::default();
         let now = Instant::now();
-        assert_eq!(gate.observe(Some(7), now), AutoPickGateState::Idle);
+        assert_eq!(gate.observe(Some(7), now), AutoPickGateState::Ready(7));
+        // A gap longer than the 500 ms stale window clears the candidate, but one frame is
+        // already enough, so the next sighting is Ready again.
         assert_eq!(
-            gate.observe(None, now + Duration::from_secs(2)),
-            AutoPickGateState::Idle
-        );
-        assert_eq!(
-            gate.observe(Some(7), now + Duration::from_secs(3)),
-            AutoPickGateState::Idle
-        );
-        assert_eq!(
-            gate.observe(
-                Some(7),
-                now + Duration::from_secs(3) + Duration::from_millis(100)
-            ),
+            gate.observe(Some(7), now + Duration::from_secs(2)),
             AutoPickGateState::Ready(7)
         );
     }
 
     #[test]
-    fn prompt_gate_resets_after_stale_or_changed_observations() {
+    fn prompt_gate_reset_clears_serviced_identities() {
         let mut gate = AutoPickPromptGate::default();
         let now = Instant::now();
-        gate.observe(Some(1), now);
+        assert_eq!(gate.observe(Some(1), now), AutoPickGateState::Ready(1));
+        gate.mark_serviced(1);
         assert_eq!(
             gate.observe(Some(1), now + Duration::from_secs(1)),
-            AutoPickGateState::Idle
-        );
-        assert_eq!(
-            gate.observe(
-                Some(1),
-                now + Duration::from_secs(1) + Duration::from_millis(100)
-            ),
-            AutoPickGateState::Ready(1)
+            AutoPickGateState::Serviced(1)
         );
         gate.reset();
-        assert_eq!(gate.observe(Some(1), now), AutoPickGateState::Idle);
+        assert_eq!(
+            gate.observe(Some(1), now + Duration::from_secs(2)),
+            AutoPickGateState::Ready(1)
+        );
     }
 }

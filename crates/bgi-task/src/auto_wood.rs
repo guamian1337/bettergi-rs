@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 pub const AUTO_WOOD_TICK: Duration = Duration::from_millis(100);
-pub const AUTO_WOOD_AFTER_USE_WAIT: Duration = Duration::from_secs(8);
+// C# presses Z then waits 300 ms plus `AfterZSleepDelay` (default 0) before OCR (`:481`).
+pub const AUTO_WOOD_AFTER_USE_WAIT: Duration = Duration::from_millis(300);
 pub const AUTO_WOOD_GAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const AUTO_WOOD_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 pub const AUTO_WOOD_LOGIN_TIMEOUT: Duration = Duration::from_secs(90);
@@ -705,18 +706,18 @@ mod tests {
     }
 
     #[test]
-    fn disabled_verification_waits_eight_seconds_and_never_logs_out() {
+    fn disabled_verification_waits_briefly_and_never_logs_out() {
         let mut controller = AutoWoodController::new(false);
         assert_eq!(
             controller.advance(observation(), at(0)),
             AutoWoodAction::UseGadget
         );
         assert_eq!(
-            controller.advance(observation(), at(7_999)),
+            controller.advance(observation(), at(299)),
             AutoWoodAction::Wait
         );
         assert_eq!(
-            controller.advance(sample("木材×3", Some(3)), at(8_000)),
+            controller.advance(sample("木材×3", Some(3)), at(300)),
             AutoWoodAction::Succeeded
         );
         assert_eq!(controller.wood_gain(), 0);

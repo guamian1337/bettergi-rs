@@ -33,6 +33,7 @@ use crate::capture_host::{
 };
 use crate::cv_service::CvOcrServices;
 use crate::fishing_host::FishingHost;
+use crate::mining_host::{MINING_TASK_NAME, MiningHost, MiningRunConfig};
 use crate::pathing_host::{CorePathingHost, PathingEvent};
 use crate::task_runtime::{ActiveTask, allocate_task_id};
 
@@ -282,7 +283,7 @@ fn character_attribute_probe_result(
         ),
         CharacterAttributeRecognitionState::Pending | CharacterAttributeRecognitionState::Failed => (
             format!("角色属性（{attempts} 次采样未稳定）"),
-            "未获得稳定结果。\n请手动停在角色属性页；左侧“属性”页门控和等级区域的所有相关 OCR 置信度必须 ≥ 0.90。\n等级区域必须恰好包含两个正整数，且当前等级不得大于等级上限。\n本测试不点击、不切换角色、不升级。".to_string(),
+            "未获得稳定结果。\n请手动停在角色属性页；等级区域需连续 3 次识别出相同的「当前等级/等级上限」。\n本测试不点击、不切换角色、不升级。".to_string(),
         ),
     };
     CvDebugResult {
@@ -814,6 +815,7 @@ fn start_basic_pathing_task(
         input_pause: None,
         held_keys: Default::default(),
         right_mouse_held: false,
+        mining_limits: crate::mining_host::MiningActionLimits::from(&snapshot.config.task_limits),
     };
 
     let worker_name = task_name.clone();
@@ -1068,6 +1070,7 @@ fn start_auto_cook_task(
         input_pause: None,
         held_keys: Default::default(),
         right_mouse_held: false,
+        mining_limits: crate::mining_host::MiningActionLimits::from(&snapshot.config.task_limits),
     };
     trigger_runtime.set_auto_pick_config(None);
     if let Ok(mut guard) = cv_ocr.try_lock() {
@@ -1305,6 +1308,7 @@ fn start_reward_claim_task(
         input_pause: None,
         held_keys: Default::default(),
         right_mouse_held: false,
+        mining_limits: crate::mining_host::MiningActionLimits::from(&snapshot.config.task_limits),
     };
     trigger_runtime.set_auto_pick_config(None);
     let join = std::thread::Builder::new()
@@ -1530,6 +1534,7 @@ fn start_one_key_expedition_task(
         input_pause: None,
         held_keys: Default::default(),
         right_mouse_held: false,
+        mining_limits: crate::mining_host::MiningActionLimits::from(&snapshot.config.task_limits),
     };
     trigger_runtime.set_auto_pick_config(None);
     let join = std::thread::Builder::new()
@@ -1947,6 +1952,21 @@ fn run_auto_wood(
         }
         host.sleep_ms(AUTO_WOOD_TICK.as_millis() as u64);
     }
+    // Every failing exit path keeps the frame that triggered it; the log line and the
+    // task error both point at the dump so a post-mortem needs no second run.
+    if matches!(report.outcome, TaskOutcome::Failed) {
+        let reason = report
+            .failure
+            .clone()
+            .unwrap_or_else(|| "自动砍树失败".into());
+        match host.save_failure_frame("auto_wood_failed") {
+            Ok(Some(path)) => {
+                report.failure = Some(format!("{reason}（截图: {}）", path.display()));
+            }
+            Ok(None) => {}
+            Err(error) => host.on_log(LogLevel::Warn, format!("自动砍树失败截图保存失败: {error}")),
+        }
+    }
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     report
 }
@@ -1988,6 +2008,7 @@ fn start_auto_wood_task(
         input_pause: None,
         held_keys: Default::default(),
         right_mouse_held: false,
+        mining_limits: crate::mining_host::MiningActionLimits::from(&snapshot.config.task_limits),
     };
     trigger_runtime.set_auto_pick_config(None);
     let join = std::thread::Builder::new()
@@ -2070,6 +2091,7 @@ fn start_open_current_chest_task(
         input_pause: None,
         held_keys: Default::default(),
         right_mouse_held: false,
+        mining_limits: crate::mining_host::MiningActionLimits::from(&snapshot.config.task_limits),
     };
     trigger_runtime.set_auto_pick_config(None);
     let join = std::thread::Builder::new()
@@ -2225,6 +2247,109 @@ fn start_fishing_task(
                 "自动钓鱼"
             },
             task_config.total_timeout_ms / 1000
+        ),
+    );
+    Ok(())
+}
+
+/// 启动自动采矿（莉奈娅）。识别与瞄准在 `mining_host` 内闭环，这里只做接线与状态发布。
+#[allow(clippy::too_many_arguments)]
+fn start_mining_task(
+    snapshot: &mut UiSnapshot,
+    capturer: &Arc<Mutex<ActiveCapturer>>,
+    pool: &Arc<FrameBufferPool>,
+    cv_ocr: &Arc<Mutex<CvOcrServices>>,
+    trigger_runtime: &mut crate::trigger_runtime::TriggerRuntime,
+    active_pathing: &mut Option<ActiveTask>,
+    next_task_id: &mut u64,
+    pathing_tx: &mpsc::UnboundedSender<PathingEvent>,
+    core: &CoreEndpoint,
+) -> Result<(), String> {
+    ensure_task_inactive(snapshot)?;
+    let Some(win) = &snapshot.selected_window else {
+        return Err("请先选择目标游戏窗口".into());
+    };
+    snapshot.config.task_limits.validate()?;
+    let limits = &snapshot.config.task_limits;
+    let config = MiningRunConfig {
+        mine_count: bgi_task::DEFAULT_MINE_COUNT,
+        scan_rounds: bgi_task::DEFAULT_SCAN_ROUNDS,
+        max_shots: u32::from(limits.mining_max_shots),
+        total_timeout_ms: limits.mining_total_timeout_ms,
+    };
+    config.validate()?;
+
+    let task_id = allocate_task_id(next_task_id);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let host = MiningHost {
+        task_id,
+        hwnd: win.hwnd,
+        mode: snapshot.config.capture_mode,
+        cancel: cancel.clone(),
+        capturer: capturer.clone(),
+        pool: pool.clone(),
+        cv_ocr: cv_ocr.clone(),
+        events_tx: pathing_tx.clone(),
+        pauses: trigger_runtime.task_pauses(),
+    };
+    trigger_runtime.set_auto_pick_config(None);
+    let join = std::thread::Builder::new()
+        .name(format!("bgi-mining-{task_id}"))
+        .spawn(move || {
+            let mut host = host;
+            let task_id = host.task_id;
+            let events_tx = host.events_tx.clone();
+            let report =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host.run_mining(config)))
+                    .unwrap_or_else(|_| {
+                        Ok(TaskReport {
+                            task_id,
+                            task_name: MINING_TASK_NAME.into(),
+                            outcome: TaskOutcome::Failed,
+                            runs_completed: 0,
+                            runs_requested: config.mine_count,
+                            current_index: None,
+                            total_points: config.mine_count as usize,
+                            failure: Some("自动采矿线程发生 panic".into()),
+                            stage: "panic".into(),
+                            elapsed_ms: 0,
+                        })
+                    })
+                    .unwrap_or_else(|error| TaskReport {
+                        task_id,
+                        task_name: MINING_TASK_NAME.into(),
+                        outcome: TaskOutcome::Cancelled,
+                        runs_completed: 0,
+                        runs_requested: config.mine_count,
+                        current_index: None,
+                        total_points: config.mine_count as usize,
+                        failure: Some(error),
+                        stage: "cancelled".into(),
+                        elapsed_ms: 0,
+                    });
+            bgi_input::release_all_keys();
+            let _ = events_tx.send(PathingEvent::Finished {
+                task_id,
+                result: Ok(report),
+            });
+        })
+        .map_err(|e| format!("启动自动采矿线程失败: {e}"))?;
+
+    *active_pathing = Some(ActiveTask::with_input_policy(task_id, cancel, join, true));
+    trigger_runtime.set_task_mode(true);
+    snapshot.task_state = TaskState::Mining {
+        task_id,
+        task_name: MINING_TASK_NAME.into(),
+    };
+    core.emit_log(
+        LogLevel::Info,
+        "Mining",
+        format!(
+            "自动采矿已启动：挖矿 {} 次、射击上限 {} 次、总超时 {} 秒。\
+             需要队伍中当前是莉奈娅并处在可瞄准状态；急停或切走窗口会立刻让步并松手。",
+            config.mine_count,
+            config.max_shots,
+            config.total_timeout_ms / 1000
         ),
     );
     Ok(())
@@ -2475,6 +2600,7 @@ fn start_artifact_salvage_preview_task(
         input_pause: None,
         held_keys: Default::default(),
         right_mouse_held: false,
+        mining_limits: crate::mining_host::MiningActionLimits::from(&snapshot.config.task_limits),
     };
     snapshot.last_salvage_preview_report = None;
     trigger_runtime.set_auto_pick_config(None);
@@ -3081,6 +3207,17 @@ pub(crate) async fn handle_command(
             core,
             dry_run,
         ),
+        CoreCommand::StartMining => start_mining_task(
+            snapshot,
+            capturer,
+            pool,
+            cv_ocr,
+            trigger_runtime,
+            active_pathing,
+            next_task_id,
+            pathing_tx,
+            core,
+        ),
         CoreCommand::StopPathing => {
             stop_and_join_active_pathing(snapshot, active_pathing, core, "已请求停止当前任务")
                 .await?;
@@ -3356,7 +3493,7 @@ mod tests {
         assert!(failed.source_label.contains("10 次采样未稳定"));
         let text = failed.ocr_text.unwrap();
         assert!(text.contains("未获得稳定结果"));
-        assert!(text.contains("恰好包含两个正整数"));
+        assert!(text.contains("连续 3 次"));
         assert!(!text.contains("当前等级：90"));
         assert!(text.contains("不点击、不切换角色、不升级"));
     }

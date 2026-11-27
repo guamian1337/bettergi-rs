@@ -42,6 +42,12 @@ impl CharacterAttributeDetails {
     }
 }
 
+/// Takes the first two integers as `(level, level_limit)`.
+///
+/// Mirrors C# `CharacterDevelopmentTask.TryParseLevelPair`: `NumberRegex.Matches` keeps
+/// every number and only requires `Count >= 2`, so trailing noise such as `90/90/1` still
+/// yields `90/90`. Reliability comes from requiring three identical samples, not from
+/// rejecting extra digits here.
 pub fn parse_character_level_pair(text: &str) -> Option<CharacterAttributeDetails> {
     let mut values = Vec::with_capacity(2);
     let mut digits = String::new();
@@ -51,8 +57,8 @@ pub fn parse_character_level_pair(text: &str) -> Option<CharacterAttributeDetail
         } else if !digits.is_empty() {
             values.push(digits.parse::<u32>().ok()?);
             digits.clear();
-            if values.len() > 2 {
-                return None;
+            if values.len() == 2 {
+                break;
             }
         }
     }
@@ -164,20 +170,18 @@ mod tests {
     }
 
     #[test]
-    fn level_pair_parser_accepts_only_two_positive_ordered_values() {
-        for (text, level, limit) in [("90/90", 90, 90), ("Lv.80\n90", 80, 90)] {
+    fn level_pair_parser_takes_first_two_positive_ordered_values() {
+        for (text, level, limit) in [
+            ("90/90", 90, 90),
+            ("Lv.80\n90", 80, 90),
+            // Extra trailing numbers are ignored, matching C# `NumberRegex.Matches[0..2]`.
+            ("90/90/90", 90, 90),
+            ("90/90/1", 90, 90),
+        ] {
             let parsed = parse_character_level_pair(text).unwrap();
             assert_eq!((parsed.level, parsed.level_limit), (level, limit));
         }
-        for text in [
-            "",
-            "90",
-            "0/90",
-            "90/89",
-            "90/90/90",
-            "90/90/1",
-            "999999999999999999/90",
-        ] {
+        for text in ["", "90", "0/90", "90/89", "999999999999999999/90"] {
             assert_eq!(parse_character_level_pair(text), None, "{text}");
         }
     }

@@ -4,9 +4,9 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, MOUSE_EVENT_FLAGS,
-    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetForegroundWindow, GetSystemMetrics, IsIconic, SM_CXVIRTUALSCREEN,
@@ -179,6 +179,23 @@ pub fn mouse_move_rel(dx: i32, dy: i32) {
     send_mouse(MOUSEEVENTF_MOVE, dx, dy, 0);
 }
 
+/// Moves the pointer relative to its current position, refusing to move a window that lost focus.
+///
+/// Aiming feeds raw pixel deltas straight into the camera, so a background window would turn the
+/// player's view; this variant is the one the mining loop must use.
+pub fn mouse_move_rel_checked(hwnd: isize, dx: i32, dy: i32) -> Result<(), &'static str> {
+    if hwnd == 0 {
+        return Err("游戏窗口句柄无效，未移动鼠标");
+    }
+    if !is_foreground_window(hwnd) {
+        return Err("游戏窗口不在前台，未移动鼠标");
+    }
+    if !send_mouse(MOUSEEVENTF_MOVE, dx, dy, 0) {
+        return Err("鼠标相对移动发送失败");
+    }
+    Ok(())
+}
+
 fn mouse_move_to_client_checked(hwnd: isize, client_x: i32, client_y: i32) -> bool {
     if hwnd == 0 {
         return false;
@@ -257,29 +274,40 @@ pub fn mouse_wheel_notch_checked(
     Ok(())
 }
 
+/// Blocks a held-button press when the target window or frame is no longer trustworthy.
+///
+/// Read twice: once before the press and once after the size/focus recheck, so a window that
+/// lost focus between the two probes still aborts before any input is sent.
+fn held_button_blocker(hwnd: isize, frame_size: (u32, u32)) -> Option<&'static str> {
+    if hwnd == 0 {
+        return Some("游戏窗口句柄无效，未按下鼠标键");
+    }
+    if !has_nonzero_frame_size(frame_size) {
+        return Some("游戏客户区尺寸无效，未按下鼠标键");
+    }
+    if !window_has_expected_client_size(hwnd, frame_size) {
+        return Some("游戏客户区尺寸已变化，未按下鼠标键");
+    }
+    if !is_foreground_window(hwnd) {
+        return Some("游戏窗口不在前台，未按下鼠标键");
+    }
+    if !window_has_expected_client_size(hwnd, frame_size) {
+        return Some("发送前游戏客户区尺寸已变化，未按下鼠标键");
+    }
+    if !is_foreground_window(hwnd) {
+        return Some("发送前游戏窗口失焦，未按下鼠标键");
+    }
+    None
+}
+
 pub fn mouse_left_down() {
     send_mouse(MOUSEEVENTF_LEFTDOWN, 0, 0, 0);
 }
 
 /// Presses the left mouse button after validating and rechecking the target window.
 pub fn mouse_left_down_checked(hwnd: isize, frame_size: (u32, u32)) -> Result<(), &'static str> {
-    if hwnd == 0 {
-        return Err("游戏窗口句柄无效，未按下鼠标左键");
-    }
-    if !has_nonzero_frame_size(frame_size) {
-        return Err("游戏客户区尺寸无效，未按下鼠标左键");
-    }
-    if !window_has_expected_client_size(hwnd, frame_size) {
-        return Err("游戏客户区尺寸已变化，未按下鼠标左键");
-    }
-    if !is_foreground_window(hwnd) {
-        return Err("游戏窗口不在前台，未按下鼠标左键");
-    }
-    if !window_has_expected_client_size(hwnd, frame_size) {
-        return Err("发送前游戏客户区尺寸已变化，未按下鼠标左键");
-    }
-    if !is_foreground_window(hwnd) {
-        return Err("发送前游戏窗口失焦，未按下鼠标左键");
+    if let Some(reason) = held_button_blocker(hwnd, frame_size) {
+        return Err(reason);
     }
     if !send_mouse(MOUSEEVENTF_LEFTDOWN, 0, 0, 0) {
         return Err("鼠标左键按下输入发送失败");
@@ -381,6 +409,36 @@ pub fn mouse_right_click() {
     mouse_right_up();
 }
 
+pub fn mouse_middle_down() {
+    send_mouse(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0);
+}
+
+/// Presses the middle mouse button after validating and rechecking the target window.
+///
+/// Element sight is held with this button, so a stale window must never receive the press.
+pub fn mouse_middle_down_checked(hwnd: isize, frame_size: (u32, u32)) -> Result<(), &'static str> {
+    if let Some(reason) = held_button_blocker(hwnd, frame_size) {
+        return Err(reason);
+    }
+    if !send_mouse(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0) {
+        return Err("鼠标中键按下输入发送失败");
+    }
+    Ok(())
+}
+
+pub fn mouse_middle_up() {
+    send_mouse(MOUSEEVENTF_MIDDLEUP, 0, 0, 0);
+}
+
+/// Releases the middle mouse button regardless of the target window's current state.
+pub fn mouse_middle_up_checked() -> Result<(), &'static str> {
+    if send_mouse(MOUSEEVENTF_MIDDLEUP, 0, 0, 0) {
+        Ok(())
+    } else {
+        Err("鼠标中键松开输入发送失败")
+    }
+}
+
 /// Releases common movement/modifier keys and mouse buttons on emergency stop.
 pub fn release_all_keys() {
     for vk in 1u16..255u16 {
@@ -453,7 +511,10 @@ fn send_key(vk: u16, up: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_nonzero_frame_size, key_tap_checked_if, mouse_left_down_checked};
+    use super::{
+        has_nonzero_frame_size, key_tap_checked_if, mouse_left_down_checked,
+        mouse_middle_down_checked, mouse_move_rel_checked,
+    };
 
     #[test]
     fn checked_key_tap_rejects_invalid_targets_and_failed_guard() {
@@ -475,5 +536,14 @@ mod tests {
         assert!(mouse_left_down_checked(0, (1920, 1080)).is_err());
         assert!(mouse_left_down_checked(0, (0, 1080)).is_err());
         assert!(mouse_left_down_checked(0, (1920, 0)).is_err());
+    }
+
+    #[test]
+    fn middle_button_and_relative_move_refuse_invalid_windows() {
+        assert!(mouse_middle_down_checked(0, (1920, 1080)).is_err());
+        assert!(mouse_middle_down_checked(0, (0, 1080)).is_err());
+        assert!(mouse_move_rel_checked(0, 10, 10).is_err());
+        // 非零但并非真实窗口的句柄也必须先过前台检查，不能落到 SendInput。
+        assert!(mouse_move_rel_checked(0x1234, 10, 10).is_err());
     }
 }

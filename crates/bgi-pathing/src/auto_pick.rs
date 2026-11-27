@@ -111,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn only_two_stable_positive_prompts_and_whitelisted_text_cause_input() {
+    fn first_positive_prompt_and_whitelisted_text_cause_input() {
         let mut host = MockHost::new((0.0, 0.0));
         let mut gate = AutoPickPromptGate::default();
         let mut matcher = AutoPickMatcher::new();
@@ -121,14 +121,12 @@ mod tests {
             ..Default::default()
         };
         host.auto_pick_frame = Some(frame(true, vec![hit("聊天"), hit("甜甜花")]));
-        assert_eq!(
-            pick_once(&mut host, &mut matcher, &mut gate, &config).unwrap(),
-            0
-        );
+        // C# presses on the first matching frame, so no warm-up sample is needed.
         assert_eq!(
             pick_once(&mut host, &mut matcher, &mut gate, &config).unwrap(),
             1
         );
+        // The same prompt is now serviced and must not be pressed again.
         assert_eq!(
             pick_once(&mut host, &mut matcher, &mut gate, &config).unwrap(),
             0
@@ -175,11 +173,11 @@ mod tests {
         host.auto_pick_frame = Some(frame(true, vec![hit("聊天"), hit("未知材料")]));
         assert_eq!(
             pick_once(&mut host, &mut matcher, &mut gate, &config).unwrap(),
-            0
+            1
         );
         assert_eq!(
             pick_once(&mut host, &mut matcher, &mut gate, &config).unwrap(),
-            1
+            0
         );
     }
 

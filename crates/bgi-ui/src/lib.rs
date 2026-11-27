@@ -206,6 +206,9 @@ impl BgiAppUi {
                     TaskState::Fishing { task_name, .. } => {
                         RichText::new(format!("钓鱼中: {task_name}")).color(Color32::GOLD)
                     }
+                    TaskState::Mining { task_name, .. } => {
+                        RichText::new(format!("采矿中: {task_name}")).color(Color32::GOLD)
+                    }
                     TaskState::Stopping {
                         task_name,
                         current_index,
@@ -610,12 +613,19 @@ impl BgiAppUi {
             }
             ui.label("一键派遣仅点击明确识别的全部领取和再次派遣；最多各一次，窗口失焦或取消立即停止，派遣图标未消失时不会按 ESC。");
             if ui
+                .add_enabled(!task_active, egui::Button::new("自动采矿（莉奈娅）"))
+                .clicked()
+            {
+                self.send_cmd(client, "启动自动采矿", CoreCommand::StartMining);
+            }
+            ui.label("自动采矿按 R 切瞄准、长按中键开元素视野、微调准心后左键挖矿；射击上限与总超时在任务安全边界里配置。要求当前角色是莉奈娅，急停或窗口失焦会立刻松手。");
+            if ui
                 .add_enabled(!task_active, egui::Button::new("自动采矿目标只读识别"))
                 .clicked()
             {
                 self.send_cmd(client, "自动采矿目标只读识别", CoreCommand::ProbeMining);
             }
-            ui.label("自动采矿仅识别 ore、聚类并选择最近目标；最多 10 帧、间隔 200ms，连续 3 帧一致才报告。模型缺失或结果不确定时报告未知；不聚焦、不移动鼠标、不点击、不切换角色、不发送按键，也不支持 mining/linnea_mining 路径动作。");
+            ui.label("只读识别仅探测 ore、聚类并选择最近目标；最多 10 帧、间隔 200ms，连续 3 帧一致才报告，模型缺失或结果不确定时报告未知；不聚焦、不移动鼠标、不点击、不发按键。");
             if snapshot.cv_debug.source_label.starts_with("自动采矿") {
                 ui.separator();
                 ui.label(format!(
@@ -783,6 +793,23 @@ impl BgiAppUi {
                     ui.add_enabled(
                         !task_active,
                         egui::DragValue::new(&mut limits.fishing_total_timeout_ms)
+                            .range(1000..=3_600_000)
+                            .speed(1000)
+                            .suffix(" ms"),
+                    );
+                    ui.end_row();
+                    ui.label("采矿射击上限:");
+                    ui.add_enabled(
+                        !task_active,
+                        egui::DragValue::new(&mut limits.mining_max_shots)
+                            .range(1..=20)
+                            .suffix(" 次"),
+                    );
+                    ui.end_row();
+                    ui.label("采矿总超时:");
+                    ui.add_enabled(
+                        !task_active,
+                        egui::DragValue::new(&mut limits.mining_total_timeout_ms)
                             .range(1000..=3_600_000)
                             .speed(1000)
                             .suffix(" ms"),

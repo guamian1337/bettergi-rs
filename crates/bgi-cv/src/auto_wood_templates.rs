@@ -22,6 +22,36 @@ pub struct AutoWoodObservation {
     pub height: u32,
 }
 
+/// Score of one auto-wood template: `best` is the raw peak correlation
+/// (0.0 when the template does not fit its ROI), `hit` is the accepted match.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WoodProbe {
+    pub best: f64,
+    pub hit: Option<(i32, i32, f64)>,
+}
+
+/// Per-template scores for the four auto-wood ROIs, kept for diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AutoWoodProbes {
+    pub gadget: WoodProbe,
+    pub menu: WoodProbe,
+    pub confirm: WoodProbe,
+    pub enter_game: WoodProbe,
+}
+
+impl AutoWoodProbes {
+    pub fn observation(&self, width: u32, height: u32) -> AutoWoodObservation {
+        AutoWoodObservation {
+            gadget: self.gadget.hit,
+            menu: self.menu.hit,
+            confirm: self.confirm.hit,
+            enter_game: self.enter_game.hit,
+            width,
+            height,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AutoWoodMatcher {
     gadget: Mat,
@@ -63,6 +93,22 @@ impl AutoWoodMatcher {
         if width < 320 || height < 240 {
             return Ok(AutoWoodObservation::default());
         }
+        Ok(self
+            .probe(full_bgr)?
+            .observation(width as u32, height as u32))
+    }
+
+    /// Same ROIs as [`Self::detect`], but keeps the peak score of every template
+    /// so callers can log near-misses as well as accepted hits.
+    pub fn probe(&self, full_bgr: &Mat) -> Result<AutoWoodProbes, CvError> {
+        if full_bgr.empty() {
+            return Ok(AutoWoodProbes::default());
+        }
+        let width = full_bgr.cols();
+        let height = full_bgr.rows();
+        if width < 320 || height < 240 {
+            return Ok(AutoWoodProbes::default());
+        }
         let mut gray = Mat::default();
         imgproc::cvt_color(
             full_bgr,
@@ -84,27 +130,16 @@ impl AutoWoodMatcher {
         let confirm_roi = Rect::new(0, 0, width, height);
         let enter_game_roi = Rect::new(0, height / 2, width, height - height / 2);
 
-        let gadget = detect_in_roi(&gray, gadget_roi, &self.gadget, scale)?;
-        let menu = detect_in_roi(&gray, menu_roi, &self.menu, scale)?;
-        let confirm = detect_in_roi(&gray, confirm_roi, &self.confirm, scale)?;
-        let enter_game = detect_in_roi(&gray, enter_game_roi, &self.enter_game, scale)?;
-        Ok(AutoWoodObservation {
-            gadget,
-            menu,
-            confirm,
-            enter_game,
-            width: width as u32,
-            height: height as u32,
+        Ok(AutoWoodProbes {
+            gadget: probe_in_roi(&gray, gadget_roi, &self.gadget, scale)?,
+            menu: probe_in_roi(&gray, menu_roi, &self.menu, scale)?,
+            confirm: probe_in_roi(&gray, confirm_roi, &self.confirm, scale)?,
+            enter_game: probe_in_roi(&gray, enter_game_roi, &self.enter_game, scale)?,
         })
     }
 }
 
-fn detect_in_roi(
-    gray: &Mat,
-    roi: Rect,
-    template: &Mat,
-    scale: f64,
-) -> Result<Option<(i32, i32, f64)>, CvError> {
+fn probe_in_roi(gray: &Mat, roi: Rect, template: &Mat, scale: f64) -> Result<WoodProbe, CvError> {
     let image = Mat::roi(gray, roi)?;
     let scaled_storage: Mat;
     let template = if (scale - 1.0).abs() > 0.02 {
@@ -126,7 +161,7 @@ fn detect_in_roi(
         template
     };
     if template.cols() > roi.width || template.rows() > roi.height {
-        return Ok(None);
+        return Ok(WoodProbe::default());
     }
     let mut result = Mat::default();
     imgproc::match_template(
@@ -146,15 +181,14 @@ fn detect_in_roi(
         Some(&mut location),
         &core::no_array(),
     )?;
-    if score.is_finite() && score >= MATCH_THRESHOLD {
-        Ok(Some((
-            roi.x + location.x + template.cols() / 2,
-            roi.y + location.y + template.rows() / 2,
-            score,
-        )))
-    } else {
-        Ok(None)
-    }
+    // OpenCV yields NaN for constant (zero-variance) regions; report them as 0.
+    let best = if score.is_finite() { score } else { 0.0 };
+    let hit = (best >= MATCH_THRESHOLD).then_some((
+        roi.x + location.x + template.cols() / 2,
+        roi.y + location.y + template.rows() / 2,
+        best,
+    ));
+    Ok(WoodProbe { best, hit })
 }
 
 fn decode_png(bytes: &[u8]) -> Result<Mat, CvError> {
@@ -250,6 +284,38 @@ mod tests {
                 }
                 assert_eq!(observation.width, (1920.0 * scale).round() as u32);
                 assert_eq!(observation.height, (1080.0 * scale).round() as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn probe_scores_agree_with_detect_decisions() {
+        let matcher = AutoWoodMatcher::new().unwrap();
+        for scale in [1.0_f64, 0.5] {
+            for (template, base, expected) in [
+                (GADGET_PNG, (1500.0, 650.0), 0usize),
+                (MENU_PNG, (20.0, 20.0), 1),
+                (CONFIRM_PNG, (80.0, 950.0), 2),
+                (ENTER_GAME_PNG, (900.0, 700.0), 3),
+            ] {
+                let screen = screen_with(template, scale, base);
+                let probes = matcher.probe(&screen).unwrap();
+                let observation = matcher.detect(&screen).unwrap();
+                assert_eq!(
+                    probes.observation(observation.width, observation.height),
+                    observation
+                );
+                let picked = [
+                    probes.gadget,
+                    probes.menu,
+                    probes.confirm,
+                    probes.enter_game,
+                ][expected];
+                assert!(
+                    picked.hit.is_some(),
+                    "scale={scale} expected={expected}: {probes:?}"
+                );
+                assert!(picked.best >= MATCH_THRESHOLD, "{picked:?}");
             }
         }
     }

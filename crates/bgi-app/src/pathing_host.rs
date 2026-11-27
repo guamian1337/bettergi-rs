@@ -14,6 +14,9 @@ use tokio::sync::mpsc;
 
 use crate::capture_host::ActiveCapturer;
 use crate::cv_service::{ArtifactSalvageStep, CvOcrServices};
+use crate::mining_host::{
+    MiningActionLimits, MiningIoAdapter, MiningRunConfig, aim_params_for_window, run_mining_loop,
+};
 
 pub(crate) enum PathingEvent {
     Progress {
@@ -51,6 +54,7 @@ pub(crate) struct CorePathingHost {
     pub(crate) input_pause: Option<PauseLease>,
     pub(crate) held_keys: BTreeSet<u16>,
     pub(crate) right_mouse_held: bool,
+    pub(crate) mining_limits: MiningActionLimits,
 }
 
 impl CorePathingHost {
@@ -142,6 +146,32 @@ impl CorePathingHost {
             .map_err(str::to_string)?;
         }
         Ok(())
+    }
+
+    /// Grabs the current frame and dumps it under `log/failed` so a failed run can be
+    /// inspected afterwards. Retries briefly because the failing tick may arrive while a
+    /// frame is still in flight. `Ok(None)` means every attempt found no frame.
+    pub(crate) fn save_failure_frame(
+        &self,
+        tag: &str,
+    ) -> Result<Option<std::path::PathBuf>, String> {
+        for attempt in 0..3 {
+            let Some(frame) = self.capture_raw_frame()? else {
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+                continue;
+            };
+            let mut guard = self.cv_ocr.lock().unwrap();
+            return guard.save_failure_frame(
+                tag,
+                frame.data.as_slice(),
+                frame.width,
+                frame.height,
+                frame.format.is_bgr24(),
+            );
+        }
+        Ok(None)
     }
 
     pub(crate) fn detect_auto_wood(
@@ -504,6 +534,58 @@ impl PathingHost for CorePathingHost {
             white_confirm,
             recover_visible,
         }))
+    }
+
+    /// 路径动作 `linnea_mining`：复用采矿任务的瞄准闭环。
+    ///
+    /// 角色切换不在本层：路径里请先自行切到莉奈娅，否则识别不到 ore 会按"未找到目标"返回错误。
+    fn run_linnea_mining(&mut self, params: Option<&str>) -> Result<(), String> {
+        let (mine_count, scan_rounds) = bgi_task::parse_linnea_mining_params(params);
+        let config = MiningRunConfig {
+            mine_count,
+            scan_rounds,
+            max_shots: self.mining_limits.max_shots,
+            total_timeout_ms: self.mining_limits.total_timeout_ms,
+        };
+        let aim = aim_params_for_window(self.hwnd);
+        let task_id = self.task_id;
+        let events_tx = self.events_tx.clone();
+        let outcome = {
+            let mut io = MiningIoAdapter::new(
+                self.hwnd,
+                self.mode,
+                self.cancel.as_ref(),
+                self.capturer.as_ref(),
+                self.pool.as_ref(),
+                self.cv_ocr.as_ref(),
+                &self.pauses,
+                Box::new(move |level, message| {
+                    let _ = events_tx.send(PathingEvent::Log {
+                        task_id,
+                        level,
+                        message,
+                    });
+                }),
+            );
+            let outcome = run_mining_loop(&mut io, config, aim);
+            io.release_inputs();
+            outcome
+        }?;
+        self.on_log(
+            LogLevel::Info,
+            format!(
+                "莉奈娅挖矿结束：挖 {} 次、射击 {} 次、{} 轮扫描",
+                outcome.mined, outcome.shots, outcome.rounds
+            ),
+        );
+        if outcome.mined == 0 {
+            // 与 C# 处理器一致：单个挖矿点没挖到不算整条路线失败，只记警告继续跑图。
+            self.on_log(
+                LogLevel::Warn,
+                "莉奈娅挖矿未挖到任何矿（目标丢失或元素视野内无 ore），继续执行后续点位".into(),
+            );
+        }
+        Ok(())
     }
 
     fn release_all_keys(&mut self) {

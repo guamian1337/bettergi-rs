@@ -87,6 +87,10 @@ pub enum TaskState {
         task_id: u64,
         task_name: String,
     },
+    Mining {
+        task_id: u64,
+        task_name: String,
+    },
     Stopping {
         task_id: u64,
         task_name: String,
@@ -108,6 +112,7 @@ impl TaskState {
                 | Self::OneKeyExpedition { .. }
                 | Self::SalvagePreview { .. }
                 | Self::Fishing { .. }
+                | Self::Mining { .. }
                 | Self::Stopping { .. }
         )
     }
@@ -264,6 +269,10 @@ pub struct TaskLimitsConfig {
     pub auto_wood_empty_ocr_limit: u8,
     #[serde(default = "default_fishing_timeout")]
     pub fishing_total_timeout_ms: u64,
+    #[serde(default = "default_mining_max_shots")]
+    pub mining_max_shots: u8,
+    #[serde(default = "default_mining_timeout")]
+    pub mining_total_timeout_ms: u64,
 }
 
 impl Default for TaskLimitsConfig {
@@ -281,6 +290,8 @@ impl Default for TaskLimitsConfig {
             auto_wood_logout_confirm_timeout_ms: 15_000,
             auto_wood_empty_ocr_limit: 3,
             fishing_total_timeout_ms: default_fishing_timeout(),
+            mining_max_shots: default_mining_max_shots(),
+            mining_total_timeout_ms: default_mining_timeout(),
         }
     }
 }
@@ -346,6 +357,12 @@ impl TaskLimitsConfig {
         if !(1000..=3_600_000).contains(&self.fishing_total_timeout_ms) {
             return Err("钓鱼总超时必须在 1000..=3600000 ms".into());
         }
+        if !(1..=20).contains(&self.mining_max_shots) {
+            return Err("采矿射击次数上限必须在 1..=20".into());
+        }
+        if !(1000..=3_600_000).contains(&self.mining_total_timeout_ms) {
+            return Err("采矿总超时必须在 1000..=3600000 ms".into());
+        }
         Ok(())
     }
 }
@@ -389,7 +406,16 @@ fn default_true() -> bool {
 }
 
 fn default_fishing_timeout() -> u64 {
-    120_000
+    // C# `AutoFishingConfig.WholeProcessTimeoutSeconds` default = 300.
+    300_000
+}
+
+fn default_mining_max_shots() -> u8 {
+    3
+}
+
+fn default_mining_timeout() -> u64 {
+    180_000
 }
 
 fn default_pathing_runs() -> u32 {
@@ -703,6 +729,7 @@ pub enum CoreCommand {
     ProbeRewardResultCards,
     ProbeExpeditionStatus,
     ProbeMining,
+    StartMining,
     BeginHotkeyCapture(Option<HotkeyAction>),
     UpdateHotkey(HotkeyBinding),
     TestInputKey { vk: u16 },
@@ -1036,7 +1063,7 @@ mod tests {
             .remove("fishing_total_timeout_ms");
         let config: CoreConfig = serde_json::from_value(value).unwrap();
         assert!(config.fishing_dry_run);
-        assert_eq!(config.task_limits.fishing_total_timeout_ms, 120_000);
+        assert_eq!(config.task_limits.fishing_total_timeout_ms, 300_000);
     }
 
     #[test]

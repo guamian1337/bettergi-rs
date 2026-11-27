@@ -199,10 +199,13 @@ fn detect_fishing_bar(full_bgr: &Mat) -> Result<Option<FishingBar>, CvError> {
         core::AlgorithmHint::ALGO_HINT_DEFAULT,
     )?;
     let mut mask = Mat::default();
+    // C# `AutoFishingImageRecognition` derives the hue window from RGB(255,255,192)
+    // ("拉条框的黄色") via CommonHSV2OpenCVHSVFull(new Scalar(60, 0.25, 1.00)) and then
+    // widens it by -3/+3.5 on H, -20/+40 on S, -10/0 on V, in HSV_FULL units.
     core::in_range(
         &hsv,
-        &Scalar::new(57.0, 44.0, 245.0, 0.0),
-        &Scalar::new(64.0, 104.0, 255.0, 0.0),
+        &Scalar::new(39.5, 43.75, 245.0, 0.0),
+        &Scalar::new(46.0, 103.75, 255.0, 0.0),
         &mut mask,
     )?;
 
@@ -368,8 +371,9 @@ mod tests {
     }
 
     fn draw_bar(image: &mut Mat, x: i32, y: i32, cursor_offset: i32, scale: f64) {
-        // BGR (172, 255, 221) is hue 60, saturation 83, value 255 in HSV-full.
-        let color = Vec3b::from([172, 255, 221]);
+        // BGR (192, 255, 255) is RGB(255, 255, 192): the yellow C# samples for the bar
+        // ("拉条框的黄色是：RGB 255, 255, 192").
+        let color = Vec3b::from([192, 255, 255]);
         let target_width = (240.0 * scale).round() as i32;
         let target_height = (20.0 * scale).round() as i32;
         draw_rect(image, x, y, target_width, target_height, color);
@@ -388,7 +392,7 @@ mod tests {
     }
 
     fn draw_split_bar(image: &mut Mat, x: i32, y: i32, cursor_offset: i32, scale: f64) {
-        let color = Vec3b::from([172, 255, 221]);
+        let color = Vec3b::from([192, 255, 255]);
         let segment_width = (80.0 * scale).round() as i32;
         let target_height = (20.0 * scale).round() as i32;
         draw_rect(image, x, y, segment_width, target_height, color);
@@ -549,7 +553,7 @@ mod tests {
     fn more_than_three_boxes_keep_the_three_tallest() {
         let matcher = FishingMatcher::new().unwrap();
         let mut image = screen(1.0);
-        let color = Vec3b::from([172, 255, 221]);
+        let color = Vec3b::from([192, 255, 255]);
         draw_rect(&mut image, 600, 400, 80, 24, color);
         draw_rect(&mut image, 700, 403, 8, 18, color);
         draw_rect(&mut image, 800, 400, 80, 24, color);
@@ -587,7 +591,7 @@ mod tests {
             400,
             40,
             20,
-            Vec3b::from([172, 255, 221]),
+            Vec3b::from([192, 255, 255]),
         );
         draw_rect(
             &mut equal_widths,
@@ -595,7 +599,7 @@ mod tests {
             403,
             40,
             14,
-            Vec3b::from([172, 255, 221]),
+            Vec3b::from([192, 255, 255]),
         );
         assert!(matcher.detect(&equal_widths, None).unwrap().bar.is_none());
 
@@ -606,7 +610,7 @@ mod tests {
             400,
             60,
             20,
-            Vec3b::from([172, 255, 221]),
+            Vec3b::from([192, 255, 255]),
         );
         draw_rect(
             &mut small_target,
@@ -614,7 +618,7 @@ mod tests {
             403,
             8,
             14,
-            Vec3b::from([172, 255, 221]),
+            Vec3b::from([192, 255, 255]),
         );
         assert!(matcher.detect(&small_target, None).unwrap().bar.is_none());
 
@@ -625,7 +629,7 @@ mod tests {
             400,
             320,
             20,
-            Vec3b::from([172, 255, 221]),
+            Vec3b::from([192, 255, 255]),
         );
         draw_rect(
             &mut cursor_right,
@@ -633,7 +637,7 @@ mod tests {
             403,
             8,
             14,
-            Vec3b::from([172, 255, 221]),
+            Vec3b::from([192, 255, 255]),
         );
         assert!(matcher.detect(&cursor_right, None).unwrap().bar.is_none());
     }

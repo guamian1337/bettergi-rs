@@ -23,6 +23,8 @@ const RESURRECTION_PNG: &[u8] = include_bytes!("../assets/ui/Resurrection.png");
 const TO_GROUND_THRESHOLD: f64 = 0.92;
 const UNDERGROUND_SWITCH_THRESHOLD: f64 = 0.80;
 const KEY_TIP_THRESHOLD: f64 = 0.78;
+/// Shared acceptance threshold for the five blocking-screen templates.
+const SCREEN_THRESHOLD: f64 = 0.82;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MotionStatus {
@@ -183,8 +185,67 @@ pub struct UiScreens {
 }
 
 impl UiScreens {
+    /// True when the in-game HUD is on screen.
+    ///
+    /// The Paimon button sits in the top-left corner of the normal HUD and is covered by
+    /// any full-screen UI (Paimon menu, dialogue, loading, cutscene), so its presence is a
+    /// positive signal for gameplay — matching C# `Bv.IsInMainUi`, which reports "main UI"
+    /// when the Paimon template is found. The remaining screens are screens *inside* the
+    /// main UI and still exclude it.
     pub fn is_gameplay(&self) -> bool {
-        !self.paimon_menu && !self.inventory && !self.in_domain && !self.cooking_page && !self.talk
+        self.paimon_menu && !self.talk && !self.in_domain && !self.cooking_page
+    }
+}
+
+/// Score of a single blocking-screen template: `best` is the raw peak correlation
+/// (0.0 when the template does not fit its ROI), `hit` is the accepted match with
+/// its client-space center and score.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ScreenProbe {
+    pub best: f64,
+    pub hit: Option<(i32, i32, f64)>,
+}
+
+impl ScreenProbe {
+    fn at(best: f64, max_loc: core::Point, template: &Mat, roi: Rect, threshold: f64) -> Self {
+        // OpenCV yields NaN for constant (zero-variance) regions; report them as 0.
+        let best = if best.is_finite() { best } else { 0.0 };
+        let hit = (best >= threshold).then_some((
+            roi.x + max_loc.x + template.cols() / 2,
+            roi.y + max_loc.y + template.rows() / 2,
+            best,
+        ));
+        Self { best, hit }
+    }
+
+    pub fn hit_at(&self) -> Option<(i32, i32)> {
+        self.hit.map(|(x, y, _)| (x, y))
+    }
+}
+
+/// Per-template scores for the five screens that must all be absent to call a frame gameplay.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct UiScreenProbes {
+    pub paimon_menu: ScreenProbe,
+    pub inventory: ScreenProbe,
+    pub in_domain: ScreenProbe,
+    pub cooking_page: ScreenProbe,
+    pub talk: ScreenProbe,
+}
+
+impl UiScreenProbes {
+    pub fn screens(&self) -> UiScreens {
+        UiScreens {
+            paimon_menu: self.paimon_menu.hit.is_some(),
+            inventory: self.inventory.hit.is_some(),
+            in_domain: self.in_domain.hit.is_some(),
+            cooking_page: self.cooking_page.hit.is_some(),
+            talk: self.talk.hit.is_some(),
+        }
+    }
+
+    pub fn is_gameplay(&self) -> bool {
+        self.screens().is_gameplay()
     }
 }
 
@@ -242,10 +303,16 @@ impl UiScreenMatcher {
     }
 
     pub fn detect(&self, full_bgr: &Mat) -> Result<UiScreens, CvError> {
+        Ok(self.probe(full_bgr)?.screens())
+    }
+
+    /// Same ROIs as [`Self::detect`], but keeps the peak score of every template
+    /// so callers can log why a frame was (not) classified as gameplay.
+    pub fn probe(&self, full_bgr: &Mat) -> Result<UiScreenProbes, CvError> {
         let cw = full_bgr.cols();
         let ch = full_bgr.rows();
         if cw < 320 || ch < 240 {
-            return Ok(UiScreens::default());
+            return Ok(UiScreenProbes::default());
         }
         let scale = (cw as f64 / 1920.0).min(ch as f64 / 1080.0);
         let top_left = clamp_roi(0, 0, cw / 4, ch / 4, cw, ch);
@@ -265,34 +332,33 @@ impl UiScreenMatcher {
             cw,
             ch,
         );
-        let paimon_menu = match top_left {
-            Some(roi) => detect_in_roi(full_bgr, roi, &self.paimon_menu, scale, 0.82)?.is_some(),
-            None => false,
-        };
-        let in_domain = match top_left {
-            Some(roi) => detect_in_roi(full_bgr, roi, &self.in_domain, scale, 0.82)?.is_some(),
-            None => false,
-        };
-        let inventory = match top_right {
-            Some(roi) => detect_in_roi(full_bgr, roi, &self.inventory, scale, 0.82)?.is_some(),
-            None => false,
-        };
-        let talk_roi = clamp_roi(0, 0, cw / 3, ch / 8, cw, ch);
-        let cooking_page = match cook_roi {
-            Some(roi) => detect_in_roi(full_bgr, roi, &self.cook_icon, scale, 0.82)?.is_some(),
-            None => false,
-        };
-        let talk = match talk_roi {
-            Some(roi) => detect_in_roi(full_bgr, roi, &self.talk, scale, 0.82)?.is_some(),
-            None => false,
-        };
-        Ok(UiScreens {
-            paimon_menu,
-            inventory,
-            in_domain,
-            cooking_page,
-            talk,
-        })
+        // One grayscale pass for all five ROIs: every screen template is decoded as
+        // grayscale, so converting each ROI separately only burns CPU.
+        let mut gray = Mat::default();
+        imgproc::cvt_color(
+            full_bgr,
+            &mut gray,
+            COLOR_BGR2GRAY,
+            0,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
+        let mut probes = UiScreenProbes::default();
+        if let Some(roi) = top_left {
+            probes.paimon_menu =
+                probe_in_gray(&gray, roi, &self.paimon_menu, scale, SCREEN_THRESHOLD)?;
+            probes.in_domain = probe_in_gray(&gray, roi, &self.in_domain, scale, SCREEN_THRESHOLD)?;
+        }
+        if let Some(roi) = top_right {
+            probes.inventory = probe_in_gray(&gray, roi, &self.inventory, scale, SCREEN_THRESHOLD)?;
+        }
+        if let Some(roi) = cook_roi {
+            probes.cooking_page =
+                probe_in_gray(&gray, roi, &self.cook_icon, scale, SCREEN_THRESHOLD)?;
+        }
+        if let Some(roi) = clamp_roi(0, 0, cw / 3, ch / 8, cw, ch) {
+            probes.talk = probe_in_gray(&gray, roi, &self.talk, scale, SCREEN_THRESHOLD)?;
+        }
+        Ok(probes)
     }
 
     pub fn detect_auto_eat(&self, full_bgr: &Mat) -> Result<(bool, bool, bool), CvError> {
@@ -310,28 +376,32 @@ impl UiScreenMatcher {
         } else {
             false
         };
-        let Some(roi) = clamp_roi(
-            (1810.0 * scale).round() as i32,
-            (778.0 * scale).round() as i32,
-            (30.0 * scale).round() as i32,
-            (30.0 * scale).round() as i32,
-            cw,
-            ch,
-        ) else {
-            return Ok((low_hp, false, false));
-        };
-        let roi_bgr = Mat::roi(full_bgr, roi)?;
+        // C# `AutoEat/Assets/Recognition.json`: RecoveryIcon is rect(1810s,778s,23s,23s)
+        // and ResurrectionIcon is rect(1810s,778s,18s,19s) — same origin, different sizes.
         let mut gray = Mat::default();
         imgproc::cvt_color(
-            &roi_bgr,
+            full_bgr,
             &mut gray,
             COLOR_BGR2GRAY,
             0,
             core::AlgorithmHint::ALGO_HINT_DEFAULT,
         )?;
-        let recovery = match_scaled_template(&gray, &self.recovery, roi, scale, 0.80)?.is_some();
-        let resurrection =
-            match_scaled_template(&gray, &self.resurrection, roi, scale, 0.80)?.is_some();
+        let probe = |template: &Mat, w: f64, h: f64| -> Result<bool, CvError> {
+            let Some(roi) = clamp_roi(
+                (1810.0 * scale).round() as i32,
+                (778.0 * scale).round() as i32,
+                (w * scale).round() as i32,
+                (h * scale).round() as i32,
+                cw,
+                ch,
+            ) else {
+                return Ok(false);
+            };
+            let roi_img = Mat::roi(&gray, roi)?;
+            Ok(match_scaled_template(&roi_img, template, roi, scale, 0.80)?.is_some())
+        };
+        let recovery = probe(&self.recovery, 23.0, 23.0)?;
+        let resurrection = probe(&self.resurrection, 18.0, 19.0)?;
         Ok((low_hp, recovery, resurrection))
     }
 
@@ -368,24 +438,19 @@ impl UiScreenMatcher {
     }
 }
 
-fn detect_in_roi(
-    full_bgr: &Mat,
+fn probe_in_gray(
+    gray: &Mat,
     roi: Rect,
     template: &Mat,
     scale: f64,
     threshold: f64,
-) -> Result<Option<(i32, i32)>, CvError> {
-    let roi_bgr = Mat::roi(full_bgr, roi)?;
-    let mut roi_gray = Mat::default();
-    imgproc::cvt_color(
-        &roi_bgr,
-        &mut roi_gray,
-        COLOR_BGR2GRAY,
-        0,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
-    match_scaled_template(&roi_gray, template, roi, scale, threshold)
-        .map(|hit| hit.map(|(x, y, _)| (x, y)))
+) -> Result<ScreenProbe, CvError> {
+    let roi_gray = Mat::roi(gray, roi)?;
+    let Some((best, max_loc, tpl)) = match_scaled_template_raw(&roi_gray, template, roi, scale)?
+    else {
+        return Ok(ScreenProbe::default());
+    };
+    Ok(ScreenProbe::at(best, max_loc, &tpl, roi, threshold))
 }
 
 fn detect_color_in_roi(
@@ -428,13 +493,14 @@ fn clamp_roi(x: i32, y: i32, w: i32, h: i32, max_w: i32, max_h: i32) -> Option<R
     }
 }
 
-fn match_scaled_template(
+/// Peak template correlation inside `roi`, without applying a threshold.
+/// Returns `None` when the (scaled) template does not fit the ROI.
+fn match_scaled_template_raw(
     roi_img: &impl core::ToInputArray,
     tpl: &Mat,
     roi: Rect,
     scale: f64,
-    threshold: f64,
-) -> Result<Option<(i32, i32, f64)>, CvError> {
+) -> Result<Option<(f64, core::Point, Mat)>, CvError> {
     let scaled_storage: Mat;
     let tpl_ref: &Mat = if (scale - 1.0).abs() > 0.02 {
         let tw = ((tpl.cols() as f64) * scale).round().max(4.0) as i32;
@@ -470,7 +536,20 @@ fn match_scaled_template(
         Some(&mut max_loc),
         &core::no_array(),
     )?;
+    Ok(Some((max_val, max_loc, tpl_ref.try_clone()?)))
+}
 
+fn match_scaled_template(
+    roi_img: &impl core::ToInputArray,
+    tpl: &Mat,
+    roi: Rect,
+    scale: f64,
+    threshold: f64,
+) -> Result<Option<(i32, i32, f64)>, CvError> {
+    let Some((max_val, max_loc, tpl_ref)) = match_scaled_template_raw(roi_img, tpl, roi, scale)?
+    else {
+        return Ok(None);
+    };
     if max_val.is_finite() && max_val >= threshold {
         let cx = roi.x + max_loc.x + tpl_ref.cols() / 2;
         let cy = roi.y + max_loc.y + tpl_ref.rows() / 2;
@@ -528,26 +607,47 @@ mod tests {
     }
 
     #[test]
-    fn gameplay_requires_all_blocking_screens_to_be_absent() {
-        assert!(UiScreens::default().is_gameplay());
-        for screens in [
+    fn gameplay_follows_the_paimon_hud_button() {
+        // The Paimon corner button is what C# `Bv.IsInMainUi` looks for.
+        assert!(
             UiScreens {
                 paimon_menu: true,
                 ..Default::default()
-            },
+            }
+            .is_gameplay()
+        );
+        // HUD button plus inventory is still the main UI: both are常驻 elements.
+        assert!(
             UiScreens {
+                paimon_menu: true,
                 inventory: true,
                 ..Default::default()
-            },
+            }
+            .is_gameplay()
+        );
+        // Without it, nothing on screen proves we are in the game world.
+        assert!(!UiScreens::default().is_gameplay());
+        assert!(
+            !UiScreens {
+                inventory: true,
+                ..Default::default()
+            }
+            .is_gameplay()
+        );
+        // Screens layered on top of the HUD still exclude gameplay.
+        for screens in [
             UiScreens {
+                paimon_menu: true,
                 in_domain: true,
                 ..Default::default()
             },
             UiScreens {
+                paimon_menu: true,
                 cooking_page: true,
                 ..Default::default()
             },
             UiScreens {
+                paimon_menu: true,
                 talk: true,
                 ..Default::default()
             },
@@ -639,6 +739,57 @@ mod tests {
                 .unwrap();
             assert!(screens.talk, "scale={scale}: {screens:?}");
             assert!(!screens.cooking_page && !screens.inventory);
+        }
+    }
+
+    #[test]
+    fn probe_scores_agree_with_detect_decisions() {
+        let matcher = UiScreenMatcher::new().unwrap();
+        for scale in [1.0_f64, 0.5] {
+            for (template, pick) in [
+                (PAIMON_MENU_PNG, 0usize),
+                (IN_DOMAIN_PNG, 1),
+                (COOK_ICON_PNG, 2),
+                (TALK_DISABLED_UI_PNG, 3),
+            ] {
+                let screen = screen_with(template, scale);
+                let probes = matcher.probe(&screen).unwrap();
+                assert_eq!(probes.screens(), matcher.detect(&screen).unwrap());
+                assert_eq!(probes.is_gameplay(), probes.screens().is_gameplay());
+                let picked = [
+                    probes.paimon_menu,
+                    probes.in_domain,
+                    probes.cooking_page,
+                    probes.talk,
+                ][pick];
+                assert!(
+                    picked.hit.is_some(),
+                    "scale={scale} pick={pick}: {probes:?}"
+                );
+                assert!(picked.best >= SCREEN_THRESHOLD, "{picked:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn blank_frame_reports_low_scores_and_is_not_gameplay() {
+        let matcher = UiScreenMatcher::new().unwrap();
+        let screen = Mat::zeros(1080, 1920, core::CV_8UC3)
+            .unwrap()
+            .to_mat()
+            .unwrap();
+        let probes = matcher.probe(&screen).unwrap();
+        // No Paimon corner button means no evidence of the in-game HUD.
+        assert!(!probes.is_gameplay(), "{probes:?}");
+        for probe in [
+            probes.paimon_menu,
+            probes.inventory,
+            probes.in_domain,
+            probes.cooking_page,
+            probes.talk,
+        ] {
+            assert!(probe.hit.is_none(), "{probe:?}");
+            assert!(probe.best < SCREEN_THRESHOLD, "{probe:?}");
         }
     }
 

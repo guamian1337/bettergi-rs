@@ -5,6 +5,7 @@ mod core;
 mod cv_service;
 mod fishing_host;
 mod logging;
+mod mining_host;
 mod pathing_host;
 mod task_runtime;
 mod tray;

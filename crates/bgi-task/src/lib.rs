@@ -71,9 +71,12 @@ pub use lease::{
     PauseController, PauseLease, TriggerLease, TriggerLeaseRegistry, TriggerLeaseSnapshot,
 };
 pub use mining::{
-    MINING_MAX_ATTEMPTS, MINING_REQUIRED_STABLE_SAMPLES, MiningDetection, MiningObservation,
-    MiningRecognitionStability, MiningRecognitionState, MiningRect, MiningTarget,
-    filter_ore_detections, select_nearest_mining_target,
+    AIM_LIFT_COMPENSATION_PX, AIM_MAX_RETRIES, AIM_SENSITIVITY_X, AIM_SENSITIVITY_Y, AimCommand,
+    AimController, AimParams, AimProgress, DEFAULT_MINE_COUNT, DEFAULT_SCAN_ROUNDS,
+    ELEMENT_SIGHT_REFRESH_MS, MINING_MAX_ATTEMPTS, MINING_REQUIRED_STABLE_SAMPLES, MiningDetection,
+    MiningObservation, MiningRecognitionStability, MiningRecognitionState, MiningRect,
+    MiningTarget, SCAN_TURN_STEP, filter_ore_detections, parse_linnea_mining_params,
+    select_nearest_mining_target,
 };
 pub use one_key_expedition::{
     ONE_KEY_EXPEDITION_COLLECT_DELAY, ONE_KEY_EXPEDITION_RESPONSE_DELAY, ONE_KEY_EXPEDITION_TICK,

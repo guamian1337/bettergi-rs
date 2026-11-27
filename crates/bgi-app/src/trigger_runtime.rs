@@ -874,7 +874,6 @@ mod tests {
             "cancelled",
             "stale",
             "paused",
-            "unstable",
             "serviced",
             "no-config",
             "no-hits",
@@ -898,12 +897,6 @@ mod tests {
                 }
                 "paused" => {
                     _pause = Some(runtime.task_pauses().pause().unwrap());
-                }
-                "unstable" => {
-                    assert_eq!(
-                        runtime.observe_auto_pick_prompt(Some(context.prompt.identity)),
-                        AutoPickGateState::Idle
-                    );
                 }
                 "serviced" => {
                     for _ in 0..2 {
@@ -986,9 +979,11 @@ mod tests {
             AutoPickGateState::Serviced(identity)
         );
         runtime.set_auto_pick_config(runtime.auto_pick_config.clone());
+        // A single matching frame is enough (C# presses on the first hit), so the gate
+        // comes back Ready rather than waiting for a second sample.
         assert_eq!(
             runtime.observe_auto_pick_prompt(Some(identity)),
-            AutoPickGateState::Idle
+            AutoPickGateState::Ready(identity)
         );
     }
 

@@ -10,8 +10,10 @@ const CONFIDENCE_THRESHOLD: f32 = 0.70;
 const BASE_CLUSTER_DISTANCE: f64 = 400.0;
 const BASE_CLUSTER_AREA: f64 = 1800.0;
 const BASE_EDGE_IGNORE: f64 = 200.0;
+const BASE_ALIGNMENT_EXPANSION: f64 = 3.0;
 const AREA_RATIO_THRESHOLD: f64 = 4.0;
 const REFERENCE_FRAME_WIDTH: f64 = 1920.0;
+const REFERENCE_FRAME_HEIGHT: f64 = 1080.0;
 
 const UNKNOWN_MISSING_OBSERVATION: &str = "未获得有效的采矿观察";
 const UNKNOWN_INVALID_FRAME: &str = "采矿观察的画面尺寸无效";
@@ -261,6 +263,235 @@ pub fn select_nearest_mining_target(
         cluster_count,
         target: nearest.map(MineralCluster::target),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 瞄准闭环
+//
+// 与 C# `LinneaMiningTask.AlignAndMine` 同源：把「观察到的目标」换算成鼠标增量，
+// 反复微调直到目标落进对准窗口，再交给宿主松手中键 + 左键挖矿。本模块只做决策，
+// 不碰任何输入、抓图和计时器，因此可以在没有游戏与模型的情况下逐条验证。
+// ---------------------------------------------------------------------------
+
+/// 瞄准模式横向灵敏度补偿（镜头横向更快，系数更小）。
+pub const AIM_SENSITIVITY_X: f64 = 0.45;
+/// 瞄准模式纵向灵敏度补偿。
+pub const AIM_SENSITIVITY_Y: f64 = 0.80;
+/// 内层最大重试次数，用尽后只要还有结果就补一枪。
+pub const AIM_MAX_RETRIES: usize = 7;
+/// 元素视野（中键长按）刷新间隔。
+pub const ELEMENT_SIGHT_REFRESH_MS: u64 = 3000;
+/// 对准后若累计净上移，挖矿前补一次抬升，避免镜头贴地。
+pub const AIM_LIFT_COMPENSATION_PX: i32 = 25;
+/// 单轮扫描结束后左转的鼠标步长基准（按 DPI 与宽度缩放）。
+pub const SCAN_TURN_STEP: i32 = -250;
+/// 默认挖矿次数与扫描轮数（与 C# `DefaultMineCount` / `DefaultScanRounds` 一致）。
+pub const DEFAULT_MINE_COUNT: u32 = 1;
+pub const DEFAULT_SCAN_ROUNDS: u32 = 1;
+const MAX_MINING_ROUNDS: u32 = 999;
+
+/// 瞄准环节的全部缩放参数。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AimParams {
+    pub dpi_scale: f64,
+    pub width_scale: f64,
+    pub height_scale: f64,
+    pub alignment_expansion: f64,
+    pub sensitivity_x: f64,
+    pub sensitivity_y: f64,
+    pub max_retries: usize,
+    pub refresh_interval_ms: u64,
+}
+
+impl AimParams {
+    /// 按实际画面尺寸与窗口 DPI 推导参数；缩放基准沿用 C# 的 1920×1080。
+    pub fn from_frame(frame_width: u32, frame_height: u32, dpi_scale: f64) -> Self {
+        let width_scale = f64::from(frame_width.max(1)) / REFERENCE_FRAME_WIDTH;
+        let height_scale = f64::from(frame_height.max(1)) / REFERENCE_FRAME_HEIGHT;
+        let dpi_scale = if dpi_scale.is_finite() && dpi_scale > 0.0 {
+            dpi_scale
+        } else {
+            1.0
+        };
+        Self {
+            dpi_scale,
+            width_scale,
+            height_scale,
+            alignment_expansion: BASE_ALIGNMENT_EXPANSION * width_scale,
+            sensitivity_x: AIM_SENSITIVITY_X,
+            sensitivity_y: AIM_SENSITIVITY_Y,
+            max_retries: AIM_MAX_RETRIES,
+            refresh_interval_ms: ELEMENT_SIGHT_REFRESH_MS,
+        }
+    }
+
+    /// 扫描一轮后左转的鼠标水平增量（C# `(int)(LeftTurnStep * dpi * widthScale)`）。
+    pub fn scan_turn_dx(self) -> i32 {
+        (f64::from(SCAN_TURN_STEP) * self.dpi_scale * self.width_scale) as i32
+    }
+}
+
+/// 瞄准状态机给出的下一步动作，由宿主负责实际发送输入与等待。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AimCommand {
+    /// 重新按住元素视野：松开中键 → 100ms → 按住 → 1500ms，然后重新识别。
+    RefreshSight,
+    /// 相对移动鼠标后重新识别。
+    Aim { dx: i32, dy: i32 },
+    /// 已对准：松开中键，必要时补抬升，然后左键挖一次。
+    ///
+    /// `aligned` 为假表示重试用尽后的补射，宿主不应把它计入"已挖到"。
+    Mine { aligned: bool, lift_px: i32 },
+    /// 目标丢失（本帧无 ore 或聚类为空）。
+    Lost,
+    /// 没有可用重试次数。
+    Exhausted,
+}
+
+/// 当前瞄准进度，用于目标丢失后的反向补偿。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AimProgress {
+    pub retries: usize,
+    pub total_dx: i32,
+    pub total_dy: i32,
+}
+
+/// 单次瞄准的控制状态（每进入一个矿簇新建一个）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AimController {
+    params: AimParams,
+    retries: usize,
+    total_dx: i32,
+    total_dy: i32,
+    had_result: bool,
+    last_refresh_ms: u64,
+}
+
+impl AimController {
+    pub fn new(params: AimParams, now_ms: u64) -> Self {
+        Self {
+            params,
+            retries: 0,
+            total_dx: 0,
+            total_dy: 0,
+            had_result: false,
+            last_refresh_ms: now_ms,
+        }
+    }
+
+    pub fn params(&self) -> AimParams {
+        self.params
+    }
+
+    pub fn progress(&self) -> AimProgress {
+        AimProgress {
+            retries: self.retries,
+            total_dx: self.total_dx,
+            total_dy: self.total_dy,
+        }
+    }
+
+    /// 元素视野是否该刷新了；刷新不消耗重试次数。
+    pub fn needs_refresh(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_refresh_ms) >= self.params.refresh_interval_ms
+    }
+
+    pub fn mark_refreshed(&mut self, now_ms: u64) {
+        self.last_refresh_ms = now_ms;
+    }
+
+    /// 根据最新观察决定下一步。
+    ///
+    /// 返回 [`AimCommand::RefreshSight`] 后宿主需要完成松手/按住，再调用一次本方法；
+    /// 该分支不会推进重试计数。
+    pub fn decide(&mut self, observation: &MiningObservation, now_ms: u64) -> AimCommand {
+        let Some(target) = observation.target else {
+            self.had_result = false;
+            return AimCommand::Lost;
+        };
+        if self.needs_refresh(now_ms) {
+            return AimCommand::RefreshSight;
+        }
+        if self.params.max_retries == 0 {
+            return AimCommand::Exhausted;
+        }
+
+        let offset_x = target.center_x - f64::from(observation.frame_width) / 2.0;
+        let offset_y = target.center_y - f64::from(observation.frame_height) / 2.0;
+        let half_width =
+            (f64::from(target.rect.width) + self.params.alignment_expansion * 2.0) / 2.0;
+        let half_height =
+            (f64::from(target.rect.height) + self.params.alignment_expansion * 2.0) / 2.0;
+        let aligned = offset_x.abs() <= half_width && offset_y.abs() <= half_height;
+
+        // 最后一轮只要曾经识别到目标就补一枪，避免差几像素时反复空转。
+        if aligned || (self.retries + 1 >= self.params.max_retries && self.had_result) {
+            let lift_px = if self.total_dy < 0 {
+                -AIM_LIFT_COMPENSATION_PX
+            } else {
+                0
+            };
+            return AimCommand::Mine { aligned, lift_px };
+        }
+
+        let dx = (offset_x * self.params.dpi_scale * self.params.sensitivity_x
+            / self.params.width_scale) as i32;
+        let dy = (offset_y * self.params.dpi_scale * self.params.sensitivity_y
+            / self.params.height_scale) as i32;
+        self.retries += 1;
+        self.had_result = true;
+        self.total_dx = self.total_dx.saturating_add(dx);
+        self.total_dy = self.total_dy.saturating_add(dy);
+        AimCommand::Aim { dx, dy }
+    }
+}
+
+/// 解析 `linnea_mining` 路径动作参数：`"3"`、`"3,10"`、`"mines=3,rounds=10"`。
+///
+/// 非法或越界值按 C# `Clamp(value, 1, 999)` 处理，轮数不足挖矿次数时抬到挖矿次数。
+pub fn parse_linnea_mining_params(params: Option<&str>) -> (u32, u32) {
+    let Some(text) = params.map(str::trim).filter(|text| !text.is_empty()) else {
+        return (DEFAULT_MINE_COUNT, DEFAULT_SCAN_ROUNDS);
+    };
+    let mut mines: Option<u32> = None;
+    let mut rounds: Option<u32> = None;
+    for part in text.split(',') {
+        let part = part.trim();
+        if let Some(raw) = strip_prefix_ignore_ascii_case(part, "mines=") {
+            if let Ok(value) = raw.trim().parse::<i64>() {
+                mines = Some(clamp_count(value));
+            }
+        } else if let Some(raw) = strip_prefix_ignore_ascii_case(part, "rounds=") {
+            if let Ok(value) = raw.trim().parse::<i64>() {
+                rounds = Some(clamp_count(value));
+            }
+        } else if let Ok(value) = part.parse::<i64>() {
+            if mines.is_none() {
+                mines = Some(clamp_count(value));
+            } else if rounds.is_none() {
+                rounds = Some(clamp_count(value));
+            }
+        }
+    }
+    let mines = mines.unwrap_or(DEFAULT_MINE_COUNT);
+    let rounds = rounds.unwrap_or(DEFAULT_SCAN_ROUNDS).max(mines);
+    (mines, rounds)
+}
+
+fn clamp_count(value: i64) -> u32 {
+    if value <= 0 {
+        1
+    } else if value > i64::from(MAX_MINING_ROUNDS) {
+        MAX_MINING_ROUNDS
+    } else {
+        value as u32
+    }
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &text[prefix.len()..])
 }
 
 /// A successful stable observation, or an explicit unknown recognition state.
@@ -763,5 +994,231 @@ mod tests {
             MiningRecognitionState::Ready(empty),
             "a new rejection belongs to a new scan"
         );
+    }
+
+    // ---- 瞄准闭环 ----
+
+    fn target_at(
+        frame_width: u32,
+        frame_height: u32,
+        center_x: f64,
+        center_y: f64,
+        width: i32,
+        height: i32,
+    ) -> MiningObservation {
+        MiningObservation {
+            frame_width,
+            frame_height,
+            cluster_count: 1,
+            target: Some(MiningTarget {
+                rect: rect(
+                    (center_x - f64::from(width) / 2.0) as i32,
+                    (center_y - f64::from(height) / 2.0) as i32,
+                    width,
+                    height,
+                ),
+                center_x,
+                center_y,
+            }),
+        }
+    }
+
+    fn params(frame_width: u32, frame_height: u32) -> AimParams {
+        AimParams::from_frame(frame_width, frame_height, 1.0)
+    }
+
+    #[test]
+    fn aim_params_scale_with_frame_and_dpi() {
+        let full = params(1920, 1080);
+        assert_eq!((full.width_scale, full.height_scale), (1.0, 1.0));
+        assert_eq!(full.alignment_expansion, 3.0);
+        assert_eq!(full.scan_turn_dx(), SCAN_TURN_STEP);
+
+        let half = params(1280, 720);
+        assert!((half.width_scale - 2.0 / 3.0).abs() < 1e-9);
+        assert!((half.height_scale - 2.0 / 3.0).abs() < 1e-9);
+        assert!((half.alignment_expansion - 2.0).abs() < 1e-9);
+        // C# 用 (int) 截断，向零取整。
+        assert_eq!(half.scan_turn_dx(), -166);
+
+        let hidpi = AimParams::from_frame(1920, 1080, 2.0);
+        assert_eq!(hidpi.scan_turn_dx(), -500);
+        // 非法 DPI 回落到 1.0，不能把参数变成 NaN/0。
+        assert_eq!(AimParams::from_frame(0, 0, f64::NAN).dpi_scale, 1.0);
+    }
+
+    #[test]
+    fn aim_converts_offset_with_axis_specific_sensitivity() {
+        let mut aim = AimController::new(params(1920, 1080), 0);
+        assert_eq!(
+            aim.decide(&target_at(1920, 1080, 1200.0, 540.0, 100, 100), 0),
+            AimCommand::Aim { dx: 108, dy: 0 }
+        );
+        assert_eq!(aim.progress().total_dx, 108);
+
+        let mut aim = AimController::new(params(1920, 1080), 0);
+        assert_eq!(
+            aim.decide(&target_at(1920, 1080, 960.0, 700.0, 100, 100), 0),
+            AimCommand::Aim { dx: 0, dy: 128 }
+        );
+
+        // 1280×720 画面：同一相对偏移在屏幕上更小，除以 width_scale 后增量保持一致。
+        let mut scaled = AimController::new(params(1280, 720), 0);
+        assert_eq!(
+            scaled.decide(&target_at(1280, 720, 800.0, 360.0, 100, 100), 0),
+            AimCommand::Aim { dx: 108, dy: 0 }
+        );
+    }
+
+    #[test]
+    fn aim_fires_once_target_enters_the_alignment_window() {
+        let mut aim = AimController::new(params(1920, 1080), 0);
+        // 目标框 100×100 + 两侧各 3px 扩张 → 允许 53px 偏差，边界含等号。
+        assert_eq!(
+            aim.decide(&target_at(1920, 1080, 1012.0, 540.0, 100, 100), 0),
+            AimCommand::Mine {
+                aligned: true,
+                lift_px: 0,
+            }
+        );
+        assert_eq!(
+            aim.decide(&target_at(1920, 1080, 960.0, 593.0, 100, 100), 0),
+            AimCommand::Mine {
+                aligned: true,
+                lift_px: 0,
+            }
+        );
+        // 越过窗口边界一个像素就要继续微调。
+        assert_eq!(
+            aim.decide(&target_at(1920, 1080, 960.0, 594.0, 100, 100), 0),
+            AimCommand::Aim { dx: 0, dy: 43 }
+        );
+    }
+
+    #[test]
+    fn aim_lifts_before_mining_only_when_net_movement_was_upward() {
+        let mut up = AimController::new(params(1920, 1080), 0);
+        assert_eq!(
+            up.decide(&target_at(1920, 1080, 960.0, 300.0, 100, 100), 0),
+            AimCommand::Aim { dx: 0, dy: -192 }
+        );
+        assert_eq!(
+            up.decide(&target_at(1920, 1080, 960.0, 540.0, 100, 100), 1),
+            AimCommand::Mine {
+                aligned: true,
+                lift_px: -AIM_LIFT_COMPENSATION_PX,
+            }
+        );
+
+        let mut down = AimController::new(params(1920, 1080), 0);
+        assert_eq!(
+            down.decide(&target_at(1920, 1080, 960.0, 800.0, 100, 100), 0),
+            AimCommand::Aim { dx: 0, dy: 208 }
+        );
+        assert_eq!(
+            down.decide(&target_at(1920, 1080, 960.0, 540.0, 100, 100), 1),
+            AimCommand::Mine {
+                aligned: true,
+                lift_px: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn aim_reports_lost_and_forgets_previous_result() {
+        let mut aim = AimController::new(params(1920, 1080), 0);
+        aim.decide(&target_at(1920, 1080, 1400.0, 540.0, 100, 100), 0);
+        let empty = MiningObservation {
+            frame_width: 1920,
+            frame_height: 1080,
+            cluster_count: 0,
+            target: None,
+        };
+        assert_eq!(aim.decide(&empty, 100), AimCommand::Lost);
+        assert_eq!(
+            aim.progress().retries,
+            1,
+            "lost frames do not reset progress"
+        );
+        // 目标丢失后重新出现，仍按剩余重试次数继续。
+        assert!(matches!(
+            aim.decide(&target_at(1920, 1080, 1400.0, 540.0, 100, 100), 200),
+            AimCommand::Aim { dx, .. } if dx > 0
+        ));
+    }
+
+    #[test]
+    fn aim_refreshes_element_sight_without_spending_a_retry() {
+        let mut aim = AimController::new(params(1920, 1080), 0);
+        let observation = target_at(1920, 1080, 1200.0, 540.0, 100, 100);
+        assert_eq!(
+            aim.decide(&observation, 0),
+            AimCommand::Aim { dx: 108, dy: 0 }
+        );
+        assert_eq!(
+            aim.decide(&observation, ELEMENT_SIGHT_REFRESH_MS),
+            AimCommand::RefreshSight
+        );
+        assert_eq!(aim.progress().retries, 1);
+        aim.mark_refreshed(ELEMENT_SIGHT_REFRESH_MS);
+        assert!(matches!(
+            aim.decide(&observation, ELEMENT_SIGHT_REFRESH_MS),
+            AimCommand::Aim { .. }
+        ));
+    }
+
+    #[test]
+    fn aim_fires_on_the_last_retry_when_it_had_a_result() {
+        let mut aim = AimController::new(params(1920, 1080), 0);
+        let far = target_at(1920, 1080, 300.0, 200.0, 40, 40);
+        for retry in 0..AIM_MAX_RETRIES - 1 {
+            assert!(
+                matches!(aim.decide(&far, 0), AimCommand::Aim { .. }),
+                "retry {retry} should still aim"
+            );
+        }
+        assert_eq!(aim.progress().retries, AIM_MAX_RETRIES - 1);
+        assert_eq!(
+            aim.decide(&far, 0),
+            AimCommand::Mine {
+                aligned: false,
+                lift_px: -25,
+            }
+        );
+    }
+
+    #[test]
+    fn aim_without_retry_budget_refuses_to_act() {
+        let mut aim = AimController::new(
+            AimParams {
+                max_retries: 0,
+                ..params(1920, 1080)
+            },
+            0,
+        );
+        assert_eq!(
+            aim.decide(&target_at(1920, 1080, 1200.0, 540.0, 100, 100), 0),
+            AimCommand::Exhausted
+        );
+    }
+
+    #[test]
+    fn linnea_mining_params_accept_positional_keyword_and_invalid_input() {
+        assert_eq!(parse_linnea_mining_params(None), (1, 1));
+        assert_eq!(parse_linnea_mining_params(Some("  ")), (1, 1));
+        assert_eq!(parse_linnea_mining_params(Some("3")), (3, 3));
+        assert_eq!(parse_linnea_mining_params(Some("3,10")), (3, 10));
+        assert_eq!(
+            parse_linnea_mining_params(Some("mines=2, rounds=10")),
+            (2, 10)
+        );
+        assert_eq!(
+            parse_linnea_mining_params(Some("MINES=4,ROUNDS=2")),
+            (4, 4),
+            "rounds 不足 mines 时抬到 mines"
+        );
+        assert_eq!(parse_linnea_mining_params(Some("0,-5")), (1, 1));
+        assert_eq!(parse_linnea_mining_params(Some("9999,9999")), (999, 999));
+        assert_eq!(parse_linnea_mining_params(Some("abc,def")), (1, 1));
     }
 }

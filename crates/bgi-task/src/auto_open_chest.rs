@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-pub const AUTO_OPEN_CHEST_TICK: Duration = Duration::from_millis(80);
+// C# `AutoOpenChestTask` runs one move/interact step per 500 ms loop iteration (`:76`).
+pub const AUTO_OPEN_CHEST_TICK: Duration = Duration::from_millis(500);
 pub const AUTO_OPEN_CHEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub const AUTO_OPEN_CHEST_INTERACT_DELAY: Duration = Duration::from_millis(180);
 pub const AUTO_OPEN_CHEST_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);

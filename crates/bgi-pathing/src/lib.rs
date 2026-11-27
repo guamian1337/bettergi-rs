@@ -367,14 +367,14 @@ const ACTION_CAPABILITIES: &[ActionCapability] = &[
         phase: ActionPhase::After,
         support: ActionSupport::Unsupported,
         waypoint: WaypointConstraint::Any,
-        parameters: "mining configuration",
+        parameters: "character-specific attack combo; needs the combat/party module",
     },
     ActionCapability {
         code: "linnea_mining",
         phase: ActionPhase::After,
-        support: ActionSupport::Unsupported,
+        support: ActionSupport::Partial,
         waypoint: WaypointConstraint::Any,
-        parameters: "none",
+        parameters: "mines=N,rounds=M (mines do not switch characters yet)",
     },
     ActionCapability {
         code: "fishing",
@@ -573,6 +573,10 @@ mod tests {
             parsed.positions[3].action.as_deref()
         ));
         assert!(!is_basic_action_supported(Some("force_tp")));
+        assert!(is_basic_action_supported(Some("linnea_mining")));
+        assert!(!is_basic_action_supported(Some("mining")));
+        // 动作码按 C# 路径文件的大小写精确匹配。
+        assert!(!is_basic_action_supported(Some("LINNEA_MINING")));
     }
 
     #[test]

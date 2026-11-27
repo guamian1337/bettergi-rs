@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-const DEFAULT_TOTAL_TIMEOUT_MS: u64 = 120_000;
+// C# `AutoFishingConfig.WholeProcessTimeoutSeconds` default = 300.
+const DEFAULT_TOTAL_TIMEOUT_MS: u64 = 300_000;
 const HOOK_DELAY: Duration = Duration::from_millis(800);
 const FIND_BAR_TIMEOUT: Duration = Duration::from_secs(5);
 const BAR_LOST_TIMEOUT: Duration = Duration::from_secs(1);
@@ -385,8 +386,8 @@ mod tests {
     #[test]
     fn config_defaults_and_boundaries_are_validated() {
         let default = FishingConfig::default();
-        assert_eq!(default.total_timeout_ms, 120_000);
-        assert_eq!(default.total_timeout(), Duration::from_secs(120));
+        assert_eq!(default.total_timeout_ms, 300_000);
+        assert_eq!(default.total_timeout(), Duration::from_secs(300));
         assert_eq!(default.validate(), Ok(()));
         assert_eq!(FishingController::default().config(), default);
 

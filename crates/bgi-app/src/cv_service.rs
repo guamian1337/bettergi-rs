@@ -8,7 +8,7 @@ use bgi_cv::artifact_salvage::{
 use bgi_cv::assets::AssetCatalog;
 use bgi_cv::attribute_page::attribute_tab_ocr_image;
 use bgi_cv::auto_pick_templates::{AutoPickObservation, AutoPickPromptMatcher};
-use bgi_cv::auto_wood_templates::{AutoWoodMatcher, AutoWoodObservation};
+use bgi_cv::auto_wood_templates::{AutoWoodMatcher, AutoWoodObservation, AutoWoodProbes};
 use bgi_cv::chest_templates::{ChestMatcher, ChestObservation};
 use bgi_cv::expedition::{ExpeditionMatcher, ExpeditionObservation};
 use bgi_cv::fishing_templates::FishingMatcher;
@@ -20,7 +20,9 @@ use bgi_cv::reward_cards::{
 use bgi_cv::reward_templates::RewardTemplateMatcher;
 use bgi_cv::sift_map::BigMapSiftMatcher;
 use bgi_cv::teyvat_minimap::{LayerLoadScope, TeyvatMiniMapLocalizer};
-use bgi_cv::ui_templates::{MotionStatus as CvMotionStatus, UiScreenMatcher, UiTemplateMatcher};
+use bgi_cv::ui_templates::{
+    MotionStatus as CvMotionStatus, ScreenProbe, UiScreenMatcher, UiScreenProbes, UiTemplateMatcher,
+};
 use bgi_infer::paddle_ocr::{NormalizedRoi, PaddleOcrEngine, PaddleOcrPaths};
 use bgi_infer::{
     IdleUnloadPolicy, ItemIconMatch, ItemIconRecognizer, MiningDetector, OcrResult, OcrService,
@@ -50,6 +52,27 @@ pub(crate) struct ArtifactSalvageStep {
     pub(crate) icon_matches: Vec<Option<ItemIconMatch>>,
 }
 
+/// Throttles the per-tick auto-wood detection dump: state changes log at `Info`,
+/// steady-state repetitions at `Debug` no faster than this interval.
+const AUTO_WOOD_REPORT_INTERVAL: Duration = Duration::from_millis(1000);
+
+struct AutoWoodReport {
+    key: String,
+    at: Instant,
+}
+
+/// Renders one template result as `name=score` or `name=score@(x,y)` on a hit.
+fn probe_text(label: &str, best: f64, hit: Option<(i32, i32, f64)>) -> String {
+    match hit {
+        Some((x, y, score)) => format!("{label}={score:.2}@({x},{y})"),
+        None => format!("{label}={best:.2}"),
+    }
+}
+
+fn screen_text(label: &str, probe: &ScreenProbe) -> String {
+    probe_text(label, probe.best, probe.hit)
+}
+
 /// Manages lazy-loaded CV/OCR engines, pathing localization steps, debug probes, and failure dumps.
 pub(crate) struct CvOcrServices {
     assets: AssetCatalog,
@@ -76,6 +99,7 @@ pub(crate) struct CvOcrServices {
     cooking_recover: Option<(i32, i32)>,
     log_pub: LogPublisher,
     last_failed_save: Option<Instant>,
+    auto_wood_report: Option<AutoWoodReport>,
 }
 
 impl CvOcrServices {
@@ -110,6 +134,7 @@ impl CvOcrServices {
             cooking_recover: None,
             log_pub,
             last_failed_save: None,
+            auto_wood_report: None,
         }
     }
 
@@ -157,6 +182,23 @@ impl CvOcrServices {
 
     pub(crate) fn set_last_minimap_pos(&mut self, pos: Option<(f32, f32)>) {
         self.last_minimap_pos = pos;
+    }
+
+    /// Dumps one frame under `log/failed` without throttling and without logging, so the
+    /// caller can attach the path to its own failure message instead of emitting a
+    /// second, nearly identical line.
+    pub(crate) fn save_failure_frame(
+        &mut self,
+        tag: &str,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        is_bgr24: bool,
+    ) -> Result<Option<PathBuf>, String> {
+        if bytes.is_empty() || width == 0 || height == 0 {
+            return Ok(None);
+        }
+        crate::logging::save_failed_image(tag, width, height, is_bgr24, bytes).map(Some)
     }
 
     fn ensure_minimap(&mut self) -> Result<&mut TeyvatMiniMapLocalizer, String> {
@@ -649,8 +691,9 @@ impl CvOcrServices {
             LogLevel::Info,
             "OCR",
             format!(
-                "[角色属性页门控] 左侧 20% HSV 阈值 OCR 命中 {} 条 ({:.1}ms)",
+                "[角色属性页门控] 左侧 20% HSV 阈值 OCR 命中 {} 条 [{}] ({:.1}ms)",
                 gate_hits.len(),
+                ocr_hit_summary(&gate_hits),
                 gate_started.elapsed().as_secs_f32() * 1000.0
             ),
         );
@@ -668,7 +711,22 @@ impl CvOcrServices {
             level_roi.x1,
             level_roi.y1,
         )?;
-        Ok(character_attribute_details_from_hits(&level_hits))
+        let details = character_attribute_details_from_hits(&level_hits);
+        self.log_pub.emit(
+            LogLevel::Info,
+            "OCR",
+            format!(
+                "[角色属性等级区] ROI {},{},{}x{} OCR 命中 {} 条 [{}] → {}",
+                roi.x,
+                roi.y,
+                roi.width,
+                roi.height,
+                level_hits.len(),
+                ocr_hit_summary(&level_hits),
+                character_attribute_diagnosis(&level_hits)
+            ),
+        );
+        Ok(details)
     }
 
     pub(crate) fn detect_reward_result_step(
@@ -782,18 +840,97 @@ impl CvOcrServices {
         height: u32,
         is_bgr24: bool,
     ) -> Result<(AutoWoodObservation, bool), String> {
+        let started = Instant::now();
         let full_bgr =
             frame_to_bgr_mat(bytes, width, height, is_bgr24).map_err(|e| e.to_string())?;
-        let observation = self
+        let wood = self
             .ensure_auto_wood_matcher()?
-            .detect(&full_bgr)
+            .probe(&full_bgr)
             .map_err(|e| e.to_string())?;
-        let gameplay = self
+        let screens = self
             .ensure_ui_screens()?
-            .detect(&full_bgr)
-            .map_err(|e| e.to_string())?
-            .is_gameplay();
-        Ok((observation, gameplay))
+            .probe(&full_bgr)
+            .map_err(|e| e.to_string())?;
+        let gameplay = screens.is_gameplay();
+        self.report_auto_wood(&wood, &screens, gameplay, width, height, started.elapsed());
+        Ok((wood.observation(width, height), gameplay))
+    }
+
+    /// Emits the full auto-wood detection result so a failed "必须处于游戏画面"
+    /// check can be traced to a specific template and score.
+    fn report_auto_wood(
+        &mut self,
+        wood: &AutoWoodProbes,
+        screens: &UiScreenProbes,
+        gameplay: bool,
+        width: u32,
+        height: u32,
+        elapsed: Duration,
+    ) {
+        let blockers = [
+            screens.talk.hit.is_some(),
+            screens.in_domain.hit.is_some(),
+            screens.inventory.hit.is_some(),
+            screens.paimon_menu.hit.is_some(),
+            screens.cooking_page.hit.is_some(),
+        ];
+        let key = format!("{gameplay}:{blockers:?}");
+        let changed = self
+            .auto_wood_report
+            .as_ref()
+            .is_some_and(|report| report.key != key);
+        let due = self
+            .auto_wood_report
+            .as_ref()
+            .is_none_or(|report| report.at.elapsed() >= AUTO_WOOD_REPORT_INTERVAL);
+        if !changed && !due {
+            return;
+        }
+        self.auto_wood_report = Some(AutoWoodReport {
+            key,
+            at: Instant::now(),
+        });
+
+        let scale = (f64::from(width) / 1920.0).min(f64::from(height) / 1080.0);
+        let message = format!(
+            "[砍树检测] {width}x{height} s={scale:.2} t={:.1}ms gameplay={gameplay} | 屏(talk={:.2} paimon={:.2} domain={:.2} inv={:.2} cook={:.2} 阈值 0.82) | 木(gadget={:.2} menu={:.2} confirm={:.2} enter={:.2} 阈值 0.80)",
+            elapsed.as_secs_f64() * 1000.0,
+            screens.talk.best,
+            screens.paimon_menu.best,
+            screens.in_domain.best,
+            screens.inventory.best,
+            screens.cooking_page.best,
+            wood.gadget.best,
+            wood.menu.best,
+            wood.confirm.best,
+            wood.enter_game.best,
+        );
+        // Hits carry their own score and click point; append them only when present.
+        let hits: Vec<String> = [
+            screen_text("talk", &screens.talk),
+            screen_text("paimon", &screens.paimon_menu),
+            screen_text("domain", &screens.in_domain),
+            screen_text("inv", &screens.inventory),
+            screen_text("cook", &screens.cooking_page),
+            probe_text("gadget", wood.gadget.best, wood.gadget.hit),
+            probe_text("menu", wood.menu.best, wood.menu.hit),
+            probe_text("confirm", wood.confirm.best, wood.confirm.hit),
+            probe_text("enter", wood.enter_game.best, wood.enter_game.hit),
+        ]
+        .into_iter()
+        .filter(|item| item.contains('@'))
+        .collect();
+        let message = if hits.is_empty() {
+            message
+        } else {
+            format!("{message} | 命中 {}", hits.join(" "))
+        };
+        let level = if changed {
+            LogLevel::Info
+        } else {
+            LogLevel::Debug
+        };
+        self.log_pub.emit(level, "CV", message);
     }
 
     pub(crate) fn detect_fishing_step(
@@ -866,6 +1003,32 @@ impl CvOcrServices {
         is_bgr24: bool,
     ) -> Result<MiningObservation, String> {
         let started = Instant::now();
+        let observation = self.detect_mining_observation(bytes, width, height, is_bgr24, false)?;
+        self.log_pub.emit(
+            LogLevel::Info,
+            "CV",
+            format!(
+                "[自动采矿只读识别] 聚类={} 目标={} ({:.1}ms)",
+                observation.cluster_count,
+                observation.target.map_or_else(
+                    || "无".into(),
+                    |target| format!("({}, {})", target.center_x, target.center_y)
+                ),
+                started.elapsed().as_secs_f32() * 1000.0
+            ),
+        );
+        Ok(observation)
+    }
+
+    /// 采矿识别但不写日志：瞄准闭环每 150ms 采样一次，逐帧日志会淹没有效信息。
+    pub(crate) fn detect_mining_observation(
+        &mut self,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        is_bgr24: bool,
+        prefer_right: bool,
+    ) -> Result<MiningObservation, String> {
         let full_bgr =
             frame_to_bgr_mat(bytes, width, height, is_bgr24).map_err(|error| error.to_string())?;
         let detections = self
@@ -883,22 +1046,12 @@ impl CvOcrServices {
             })
             .collect::<Vec<_>>();
         let rects = filter_ore_detections(&detections);
-        let observation = select_nearest_mining_target(&rects, width, height, false);
-        self.log_pub.emit(
-            LogLevel::Info,
-            "CV",
-            format!(
-                "[自动采矿只读识别] ore框={} 聚类={} 目标={} ({:.1}ms)",
-                rects.len(),
-                observation.cluster_count,
-                observation.target.map_or_else(
-                    || "无".into(),
-                    |target| format!("({}, {})", target.center_x, target.center_y)
-                ),
-                started.elapsed().as_secs_f32() * 1000.0
-            ),
-        );
-        Ok(observation)
+        Ok(select_nearest_mining_target(
+            &rects,
+            width,
+            height,
+            prefer_right,
+        ))
     }
 
     pub(crate) fn detect_auto_pick_prompt(
@@ -1515,7 +1668,11 @@ impl CvOcrServices {
 
 const WEAPON_MIN_OCR_CONFIDENCE: f32 = 0.9;
 const TALENT_MIN_OCR_CONFIDENCE: f32 = 0.9;
-const CHARACTER_ATTRIBUTE_MIN_OCR_CONFIDENCE: f32 = 0.9;
+/// Floor for rejecting OCR noise only. C# `CharacterDevelopmentTask.OcrText` performs no
+/// score filtering at all and relies on "three identical samples" for correctness; keeping
+/// the floor above 0.9 rejected perfectly usable `90/90` reads whose single-glyph score
+/// dipped to ~0.88, which made the 10-sample window fail.
+const CHARACTER_ATTRIBUTE_MIN_OCR_CONFIDENCE: f32 = 0.5;
 const REWARD_COUNT_MIN_OCR_CONFIDENCE: f32 = 0.9;
 
 fn weapon_roi_to_normalized(roi: WeaponPixelRoi, width: u32, height: u32) -> NormalizedRoi {
@@ -1627,6 +1784,38 @@ fn character_attribute_roi_to_normalized(
     }
 }
 
+/// Renders OCR hits as `"文本"@0.97` items so a failing gate can be read directly from
+/// the log instead of guessing which region went wrong.
+fn ocr_hit_summary(hits: &[OcrHit]) -> String {
+    if hits.is_empty() {
+        return "-".to_string();
+    }
+    hits.iter()
+        .map(|hit| format!("{:?}@{:.2}", hit.text, hit.confidence))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Explains why the level region did or did not produce a level pair.
+fn character_attribute_diagnosis(hits: &[OcrHit]) -> String {
+    if hits.is_empty() {
+        return "等级区未识别到任何文本（ROI 可能偏移或画面未停在属性页）".to_string();
+    }
+    if let Some(low) = hits.iter().find(|hit| {
+        !hit.confidence.is_finite() || hit.confidence < CHARACTER_ATTRIBUTE_MIN_OCR_CONFIDENCE
+    }) {
+        return format!(
+            "置信度不足: {:?}@{:.2} < {:.2}",
+            low.text, low.confidence, CHARACTER_ATTRIBUTE_MIN_OCR_CONFIDENCE
+        );
+    }
+    let joined = join_ocr_hits(hits);
+    match parse_character_level_pair(&joined) {
+        Some(details) => format!("Lv {}/{}", details.level, details.level_limit),
+        None => format!("无法解析出「当前等级/等级上限」: {joined:?}"),
+    }
+}
+
 fn attribute_page_from_hits(hits: &[OcrHit]) -> bool {
     hits.iter().any(|hit| {
         hit.text.contains("属性")
@@ -1688,10 +1877,13 @@ fn classify_screens(screens: &bgi_cv::ui_templates::UiScreens) -> UiCategory {
         UiCategory::Talk
     } else if screens.in_domain {
         UiCategory::Domain
+    } else if screens.paimon_menu {
+        // The Paimon corner button is a HUD element, so its presence means the in-game
+        // view (C# `Bv.IsInMainUi`) rather than the menu. Inventory stays after it as a
+        // fallback because that button is also part of the normal HUD.
+        UiCategory::Gameplay
     } else if screens.inventory {
         UiCategory::Inventory
-    } else if screens.paimon_menu {
-        UiCategory::Menu
     } else {
         UiCategory::Unknown
     }
@@ -1943,14 +2135,14 @@ mod tests {
     }
 
     #[test]
-    fn character_attribute_ocr_requires_confident_page_gate_and_complete_level_pair() {
+    fn character_attribute_ocr_accepts_page_gate_and_level_pair() {
         let hit = |text: &str, confidence: f32| OcrHit {
             text: text.into(),
             center_x: 0,
             center_y: 0,
             confidence,
         };
-        assert!(attribute_page_from_hits(&[hit("属性", 0.9)]));
+        assert!(attribute_page_from_hits(&[hit("属性", 0.55)]));
         assert!(attribute_page_from_hits(&[
             hit("武器", 0.1),
             hit("属性", 0.99),
@@ -1958,7 +2150,7 @@ mod tests {
         for invalid_gate in [
             vec![],
             vec![hit("武器", 0.99)],
-            vec![hit("属性", 0.89)],
+            vec![hit("属性", 0.49)],
             vec![hit("属性", f32::NAN)],
         ] {
             assert!(!attribute_page_from_hits(&invalid_gate));
@@ -1967,12 +2159,18 @@ mod tests {
         let details =
             character_attribute_details_from_hits(&[hit("Lv.90", 0.95), hit("90", 0.99)]).unwrap();
         assert_eq!((details.level, details.level_limit), (90, 90));
+        // A glyph scoring below the old 0.90 floor must not void the sample.
+        let loose =
+            character_attribute_details_from_hits(&[hit("90", 0.88), hit("90", 0.91)]).unwrap();
+        assert_eq!((loose.level, loose.level_limit), (90, 90));
+        // Trailing digits are ignored, as in C# `NumberRegex.Matches[0..2]`.
+        let extra = character_attribute_details_from_hits(&[hit("90/90/90", 0.99)]).unwrap();
+        assert_eq!((extra.level, extra.level_limit), (90, 90));
         for invalid_level in [
             vec![],
             vec![hit("90", 0.99)],
             vec![hit("90/89", 0.99)],
-            vec![hit("90/90/90", 0.99)],
-            vec![hit("90", 0.99), hit("90", 0.89)],
+            vec![hit("90", 0.99), hit("90", 0.49)],
             vec![hit("90/90", f32::INFINITY)],
         ] {
             assert!(character_attribute_details_from_hits(&invalid_level).is_none());
@@ -2034,7 +2232,14 @@ mod tests {
                 paimon_menu: true,
                 ..Default::default()
             }),
-            UiCategory::Menu
+            UiCategory::Gameplay
+        );
+        assert_eq!(
+            classify_screens(&UiScreens {
+                inventory: true,
+                ..Default::default()
+            }),
+            UiCategory::Inventory
         );
         assert_eq!(
             classify_screens(&UiScreens {
@@ -2042,7 +2247,7 @@ mod tests {
                 inventory: true,
                 ..Default::default()
             }),
-            UiCategory::Inventory
+            UiCategory::Gameplay
         );
         assert_eq!(
             classify_screens(&UiScreens {
